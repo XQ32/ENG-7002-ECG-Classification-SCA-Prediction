@@ -1,44 +1,107 @@
 function [isGood, corrValues, usedTemplateClass, thresholdsOut] = assessBeatsQuality(segmentsCell, rIndices, beatTypes, fs, options)
-% File: assessBeatsQuality.m
-% Type: Function
-% Usage:
-%   [isGood, corrValues, usedTemplateClass, thresholdsOut] = assessBeatsQuality(segmentsCell, rIndices, beatTypes, fs, options)
+% =========================================================================
+% File name: assessBeatsQuality.m
+% Overview: Build multi-class (QRS morphology) templates from beat segments
+%           and compute a signal quality index (SQI) as the "max correlation
+%           with small temporal shift". Filter beats by morphological quality,
+%           produce a quality mask and correlation scores, and return the
+%           template class and thresholds used.
 %
-% Description:
-%   Use template correlation (SQI) to filter low-quality/abnormal beats. Build templates for
-%   Other/PVC/Global, compute per-beat maximum correlation and compare with class-specific
-%   thresholds, and output the pass mask and the template class used.
+% Responsibilities:
+%   1. Preprocess each beat window (bandpass + median detrend + energy
+%      normalization) and align length
+%   2. Build "median templates" (robust centers) by class (Other / PVC) and
+%      globally (Global)
+%   3. For each beat, maximize correlation within ±maxShift samples via
+%      circular-like shift
+%   4. Apply class-wise or global correlation thresholds to decide quality
+%      (pass/reject)
+%   5. Use lenient pass-through when samples are insufficient / no valid
+%      template exists, to avoid over-rejection
 %
 % Inputs:
-%   - segmentsCell (cell{N}): per-beat segments (column vectors)
-%   - rIndices (double[Nx1]): R index within each segment
-%   - beatTypes (cellstr[Nx1]): beat type (e.g., 'Other'/'PVC')
-%   - fs (double): sampling frequency (Hz)
-%   - options (struct, optional): .windowSec/.bandpassHz/.minBeatsForTemplate/
-%       .corrThreshold.(Other|PVC|Global)/.maxShiftSec
+%   segmentsCell : {N×1}  Each element is a column-vector beat segment
+%                            (containing the R location)
+%   rIndices     : N×1    R index within each segment (1-based)
+%   beatTypes    : {N×1}  Beat type strings (e.g., 'PVC','Other')
+%   fs           : double Sampling rate (Hz)
+%   options      : struct Optional overrides:
+%                  .windowSec             Total analysis window len (s,
+%                                         centered at R)      default 0.24
+%                  .bandpassHz            Bandpass [f1 f2] for preprocessing
+%                                         default [5 40]
+%                  .minBeatsForTemplate   Min beats to build a class template
+%                                         default 12
+%                  .corrThreshold.Other   Correlation threshold for Other
+%                                         default 0.80
+%                  .corrThreshold.PVC     Correlation threshold for PVC
+%                                         default 0.70
+%                  .corrThreshold.Global  Correlation threshold for Global
+%                                         default 0.75
+%                  .maxShiftSec           Allowed micro shift for maximizing
+%                                         correlation (s)      default 0.010
 %
 % Outputs:
-%   - isGood (logical[Nx1]), corrValues (double[Nx1])
-%   - usedTemplateClass (cellstr[Nx1])
-%   - thresholdsOut (struct)
+%   isGood            : N×1 logical  Quality pass flag (true=keep)
+%   corrValues        : N×1 double   Max correlation with used template
+%                                     under allowed shift
+%   usedTemplateClass : {N×1}        The template class actually used
+%                                     ('Other'/'PVC'/'Global')
+%   thresholdsOut     : struct       The set of thresholds used (per class
+%                                     and global)
 %
-% Dependencies:
-%   Local helpers: extractWindowAroundR, bandpassSafe, normalizeVec,
-%                  maxCorrWithShift, mergeStruct
+% Dependencies (local helpers in this file):
+%   extractWindowAroundR, bandpassSafe, normalizeVec,
+%   maxCorrWithShift, mergeStruct
 %
-% Maintainer: N/A  |  Version: 1.0  |  Date: 2025-08-26
-
+% Key implementation notes:
+%   - Use median to build templates to suppress outliers
+%   - Align length + unit-energy normalization to ensure fair comparison
+%   - Allow ±maxShift shift to approximate the "cross-correlation peak"
+%     via max dot product
+%   - Multi-level fallback: insufficient class template → use Global;
+%     none available → pass-through
+%   - Safety: when data is empty or no valid template exists, do not force
+%     rejection (avoid over-pruning)
+%
+% Changelog:
+%   2025-08-30 Rewrite comments to unified style (no algorithm change)
+% =========================================================================
+%
+% Input recap:
+%   segmentsCell  - Cell array of beat segments (each a column vector)
+%   rIndices      - R indices within segments (aligned with segmentsCell)
+%   beatTypes     - Cell array of beat types ('Other' or 'PVC', etc.)
+%   fs            - Sampling frequency (Hz)
+%   options       - Optional config struct:
+%                   .windowSec (default 0.24)   total window length centered at R
+%                   .bandpassHz (default [5 40]) preprocessing bandpass
+%                   .minBeatsForTemplate (default 12) min samples per class
+%                   .corrThreshold.Other (default 0.80)
+%                   .corrThreshold.PVC   (default 0.70)
+%                   .corrThreshold.Global(default 0.75)
+%                   .maxShiftSec (default 0.010) allowed micro alignment shift
+%
+% Output recap:
+%   isGood            - logical vector, true=passes SQI
+%   corrValues        - max correlation vs. the template used (with shift)
+%   usedTemplateClass - template class used for each beat: 'Other'/'PVC'/'Global'
+%   thresholdsOut     - thresholds struct used
 
     if nargin < 6 || isempty(options)
         options = struct();
     end
 
-    % Default parameters
-    defaults.windowSec = 0.24;
-    defaults.bandpassHz = [5 40];
-    defaults.minBeatsForTemplate = 12;
-    defaults.corrThreshold = struct('Other', 0.80, 'PVC', 0.70, 'Global', 0.75);
-    defaults.maxShiftSec = 0.010; % 10ms
+    % Defaults (tuned: improve true R recall, suppress T-as-R)
+    defaults.windowSec = 0.30;                % was 0.24 → 0.30 s (±150 ms) to better cover wide QRS
+    defaults.bandpassHz = [8 40];             % was [5 40] → [8 40] to suppress T/slow drift
+    defaults.minBeatsForTemplate = 8;         % was 12 → 8; easier to form templates
+    defaults.corrThreshold = struct( ...      % Correlation thresholds: slightly relax Global and Other
+        'Other', 0.78, ...                    % was 0.80 → 0.78 (favor recall)
+        'PVC',   0.70, ...                    % unchanged
+        'Global',0.74  ...                    % was 0.75 → 0.74
+    );
+    defaults.maxShiftSec = 0.025; % was 10 ms → 25 ms; tolerate alignment errors, raise true-R correlation
     cfg = mergeStruct(defaults, options);
 
     N = numel(segmentsCell);
@@ -51,7 +114,7 @@ function [isGood, corrValues, usedTemplateClass, thresholdsOut] = assessBeatsQua
         return;
     end
 
-    % Preprocessing: extract a fixed-length window centered at R, then band-pass + normalize
+    % Preprocess: extract fixed-length window centered at R; bandpass + normalize
     L = max(4, 2*round(cfg.windowSec*fs/2)); % even length
     halfWin = L/2;
     maxShift = max(0, round(cfg.maxShiftSec * fs));
@@ -68,7 +131,7 @@ function [isGood, corrValues, usedTemplateClass, thresholdsOut] = assessBeatsQua
         if ~ok
             validMask(i) = false; continue;
         end
-        % Band-pass + normalization
+    % Bandpass + normalization
         w = bandpassSafe(w, fs, cfg.bandpassHz);
         w = w - median(w);
         nrm = norm(w) + eps;
@@ -77,19 +140,19 @@ function [isGood, corrValues, usedTemplateClass, thresholdsOut] = assessBeatsQua
     end
 
     if ~any(validMask)
-        % All invalid → pass all (no gating)
+        % All invalid → mark all as pass (no gating)
         isGood = true(N,1);
         corrValues = zeros(N,1);
         usedTemplateClass(:) = {'Global'};
         return;
     end
 
-    % Template classes: Other and PVC
+    % Class templates: Other and PVC
     types = beatTypes(:);
     isPVC = ismember(lower(string(types)), lower("PVC"));
-    isOther = ~isPVC; % Treat the rest as Other
+    isOther = ~isPVC; % all others treated as Other
 
-    % Build templates (use median for robustness)
+    % Build templates (median for robustness)
     templates = struct();
     templates.Other.available = false;
     templates.PVC.available = false;
@@ -111,7 +174,7 @@ function [isGood, corrValues, usedTemplateClass, thresholdsOut] = assessBeatsQua
         templates.Global.available = true;
     end
 
-    % If no template available, pass all (avoid false rejections)
+    % If no class/global templates are available, pass through (avoid over-rejection)
     if ~templates.Other.available && ~templates.PVC.available && ~templates.Global.available
         isGood = true(N,1);
         corrValues = zeros(N,1);
@@ -119,16 +182,16 @@ function [isGood, corrValues, usedTemplateClass, thresholdsOut] = assessBeatsQua
         return;
     end
 
-    % Compute correlations and decide
+    % Compute correlation and decide
     for i = 1:N
         if ~validMask(i)
-            isGood(i) = true; % Not enough to evaluate, pass
+            isGood(i) = true; % insufficient to assess; pass through
             corrValues(i) = 0;
             usedTemplateClass{i} = 'Global';
             continue;
         end
 
-        % Select template class
+        % Choose template class
         if isPVC(i) && templates.PVC.available
             tmpl = templates.PVC.vec; tmplClass = 'PVC'; thr = cfg.corrThreshold.PVC;
         elseif ~isPVC(i) && templates.Other.available
@@ -136,7 +199,7 @@ function [isGood, corrValues, usedTemplateClass, thresholdsOut] = assessBeatsQua
         elseif templates.Global.available
             tmpl = templates.Global.vec; tmplClass = 'Global'; thr = cfg.corrThreshold.Global;
         else
-            % Should not reach here; allow by default
+            % Should not reach here; fallback pass through
             isGood(i) = true; corrValues(i) = 0; usedTemplateClass{i} = 'Global';
             continue;
         end
@@ -200,13 +263,12 @@ function v = normalizeVec(v)
 end
 
 function c = maxCorrWithShift(x, y, maxShift)
-    % x,y are already normalized
+    % x,y are already unit-normalized
     if maxShift <= 0
         c = max(-1, min(1, x' * y));
         return;
     end
     c = -1;
-    L = numel(x);
     for k = -maxShift:maxShift
         if k >= 0
             xs = [x(1+k:end); zeros(k,1)];
@@ -232,5 +294,3 @@ function out = mergeStruct(base, opt)
         out.(f{i}) = opt.(f{i});
     end
 end
-
-

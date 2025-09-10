@@ -1,25 +1,61 @@
 function [trainedClassifier, validationAccuracy] = trainBeatsClassifier(trainingData, modelOptions)
+% ========================================================================
 % File: trainBeatsClassifier.m
-% Type: Function
-% Usage:
-%   [trainedClassifier, validationAccuracy] = trainBeatsClassifier(trainingData, modelOptions)
-%
-% Description:
-%   Train a binary beat classifier (Other vs PVC) using AdaBoost trees with class-frequency weights;
-%   optional cost matrix and threshold moving via modelOptions.
-%
+% Overview: Train a beat-type classifier (PVC vs Other) from a feature table using
+%           an AdaBoostM1 ensemble of decision trees. Supports class-frequency
+%           observation weights, an optional cost matrix, and optional threshold
+%           moving to trade PVC precision/recall.
+% Responsibilities:
+%   1) Accept a table (trainingData) with numeric predictors and a BeatType
+%      label ('Other'/'PVC').
+%   2) Assemble the predictor set (RR / amplitudes / QRS duration / area) and
+%      build observation weights for class balancing.
+%   3) Optionally apply a cost matrix (false positive costFP, false negative
+%      costFN) to adjust the decision boundary.
+%   4) Train an AdaBoostM1 ensemble (tree template: MaxNumSplits=100,
+%      MinLeafSize=10, LearnRate=0.2).
+%   5) If threshold moving is enabled (enableThresholdMoving), use pvcThreshold
+%      to re-threshold the PVC probability/score.
+%   6) Return a structured output: the trained model, predictFcn, required
+%      variable list, and 10-fold cross-validation accuracy.
 % Inputs:
-%   - trainingData (table)
-%   - modelOptions (struct, optional): enableCostMatrix/costFP/costFN/enableThresholdMoving/pvcThreshold
-%
+%   trainingData (table):
+%       Required columns: {'RR_Prev','RR_Post','R_Amplitude','Q_Amplitude',
+%                          'S_Amplitude','QRS_Duration','QRS_Area','BeatType'}
+%       BeatType label values: 'Other' or 'PVC'
+%   modelOptions (struct, optional):
+%       .enableCostMatrix (logical)  : whether to enable a 2x2 cost matrix (default false)
+%       .costFP (double)             : cost C(1,2) for Other->PVC (default 1)
+%       .costFN (double)             : cost C(2,1) for PVC->Other (default 5)
+%       .enableThresholdMoving       : whether to apply post-hoc threshold moving (default false)
+%       .pvcThreshold (double)       : threshold in [0,1] (default 0.50)
 % Outputs:
-%   - trainedClassifier (struct) and validationAccuracy (double)
-%
-% Dependencies:
-%   Statistics and Machine Learning Toolbox built-ins
-%
-% Maintainer: N/A  |  Version: 1.0  |  Date: 2025-08-26
+%   trainedClassifier (struct):
+%       .predictFcn(table) -> [labels,scores] (if threshold moving enabled, returns labels + raw scores)
+%       .ClassificationEnsemble        : underlying fitcensemble model
+%       .RequiredVariables (cellstr)   : required predictor list
+%       .Options                       : modelOptions used for training
+%       .About / .HowToPredict         : metadata
+%   validationAccuracy (double)        : 10-fold cross-validation accuracy (0-1)
+% Key implementation notes:
+%   - Class-frequency weighting: inverse-frequency per class to mitigate imbalance.
+%   - Cost matrix: affects cost-sensitive decisions during boosting.
+%   - Threshold moving: compare rawScores(:,PVC) against pvcThreshold to tune recall/precision.
+%   - Cross-validation: crossval(K=10) for generalization performance.
+%   - Robust label normalization: string/categorical converted to cellstr.
+% Edge cases and robustness:
+%   - If one class is missing: fall back to equal weights (avoid divide-by-zero/Inf).
+%   - Missing modelOptions fields are filled with defaults.
+%   - With threshold moving, preserve the original score matrix for later tuning.
+% Changelog:
+%   2025-08-30: English header normalization; training logic unchanged.
+% ========================================================================
 
+
+% Extract predictors and response
+% The following code prepares data in the proper shape for training.
+%
+% The second argument is optional
 if nargin < 2 || isempty(modelOptions)
     modelOptions = struct();
 end
@@ -33,13 +69,13 @@ inputTable = trainingData;
 predictorNames = {'RR_Prev', 'RR_Post', 'R_Amplitude', 'Q_Amplitude', 'S_Amplitude', 'QRS_Duration', 'QRS_Area'};
 predictors = inputTable(:, predictorNames);
 response = inputTable.BeatType;
-isCategoricalPredictor = [false, false, false, false, false, false, false];
+isCategoricalPredictor = [false, false, false, false, false, false, false]; %#ok<NASGU>
 classNames = {'Other'; 'PVC'};
 
-% Compute observation weights from class frequencies (no discard)
+% Compute observation weights from class frequencies (without discarding samples)
 numObservations = height(inputTable);
 numClasses = numel(classNames);
-% Normalize response to cellstr for comparison
+% Normalize response to cellstr for consistent comparisons
 if isstring(response)
     response = cellstr(response);
 end
@@ -58,16 +94,17 @@ if countOther > 0 && countPVC > 0
     obsWeights(strcmp(response, 'Other')) = classWeights(1);
     obsWeights(strcmp(response, 'PVC'))   = classWeights(2);
 else
-    % If a class is missing in training set, fallback to equal weights
+    % If one class is absent in the training set, fall back to equal weights to avoid div-by-zero/Inf
     obsWeights = ones(numObservations, 1);
 end
 
-% Train classifier: set options and train
+% Train classifier
+% The following sets all classifier options and fits the model.
 template = templateTree(...
     'MaxNumSplits', 100, ...
     'MinLeafSize', 10, ...
     'NumVariablesToSample', 'all');
-% Optional cost matrix (2x2), order: {'Other','PVC'}
+% Build optional 2x2 cost matrix, order corresponds to {'Other','PVC'}
 fitArgs = {...
     predictors, ...
     response, ...
@@ -80,18 +117,19 @@ fitArgs = {...
 };
 
 if modelOptions.enableCostMatrix
-    % Cost matrix C(i,j): true i predicted j
-    % FN (PVC->Other) cost high: C(2,1)=costFN; FP (Other->PVC) cost: C(1,2)=costFP
+    % Cost matrix C(i,j): cost of predicting j when the true class is i
+    % Higher cost for false negatives (PVC->Other): C(2,1)=costFN; false positives (Other->PVC): C(1,2)=costFP
     C = [0, modelOptions.costFP; modelOptions.costFN, 0];
     fitArgs = [fitArgs, {'Cost', C}]; %#ok<AGROW>
 end
 
 classificationEnsemble = fitcensemble(fitArgs{:});
 
-% Create result struct
+% Create the result struct with predict function
 predictorExtractionFcn = @(t) t(:, predictorNames);
-% Prediction function with threshold moving
+% Predict function: supports optional threshold moving
 if modelOptions.enableThresholdMoving
+    % Return both labels and scores
     threshold = modelOptions.pvcThreshold;
     thresholdPredictFcn = @(tbl) localThresholdPredict(tbl, predictorExtractionFcn, classificationEnsemble, threshold);
     trainedClassifier.predictFcn = thresholdPredictFcn;
@@ -100,38 +138,41 @@ else
     trainedClassifier.predictFcn = @(x) ensemblePredictFcn(predictorExtractionFcn(x));
 end
 
-% Add fields to result struct
+% Populate fields on the result struct
 trainedClassifier.RequiredVariables = {'RR_Prev', 'RR_Post', 'R_Amplitude', 'Q_Amplitude', 'S_Amplitude', 'QRS_Duration', 'QRS_Area'};
 trainedClassifier.ClassificationEnsemble = classificationEnsemble;
-trainedClassifier.Options = modelOptions;
-trainedClassifier.About = 'Model exported from Classification Learner R2025a.';
-trainedClassifier.HowToPredict = sprintf('To predict using a new table T:\n [yfit,scores] = c.predictFcn(T)\nReplace ''c'' with the variable name (e.g., ''trainedModel'').\n\nTable T must include variables returned by:\n c.RequiredVariables\nFormats must match the training data; other variables are ignored.\n\nSee <a href="matlab:helpview(fullfile(docroot, ''stats'', ''stats.map''), ''appclassification_exportmodeltoworkspace'')">How to predict using an exported model</a>.');
+trainedClassifier.Options = modelOptions; % Store training-time options and threshold
+trainedClassifier.About = 'This struct contains a trained model exported from Classification Learner R2025a.';
+trainedClassifier.HowToPredict = sprintf('To make predictions on a new table T, use:\n [yfit,scores] = c.predictFcn(T) \nReplace ''c'' with the variable name of this struct, e.g., ''trainedModel''.\n \nTable T must contain the variables returned by:\n c.RequiredVariables \nThe formats (e.g., matrix/vector, data type) must match the original training data.\nOther variables in T are ignored.\n \nFor details, see <a href="matlab:helpview(fullfile(docroot, ''stats'', ''stats.map''), ''appclassification_exportmodeltoworkspace'')">How to predict using an exported model</a>.');
 
-% Extract predictors/response and prepare data for training
+% Extract predictors and response (duplicate block kept as in exported template)
+% The following code prepares data in the proper shape for training.
 %
 inputTable = trainingData;
 predictorNames = {'RR_Prev', 'RR_Post', 'R_Amplitude', 'Q_Amplitude', 'S_Amplitude', 'QRS_Duration', 'QRS_Area'};
 predictors = inputTable(:, predictorNames);
 response = inputTable.BeatType;
-isCategoricalPredictor = [false, false, false, false, false, false, false];
-classNames = {'Other'; 'PVC'};
+isCategoricalPredictor = [false, false, false, false, false, false, false]; %#ok<NASGU>
+classNames = {'Other'; 'PVC'}; %#ok<NASGU>
 
 % Cross-validation
 partitionedModel = crossval(trainedClassifier.ClassificationEnsemble, 'KFold', 10);
 
-% Validation predictions
-[validationPredictions, validationScores] = kfoldPredict(partitionedModel);
+% Compute validation predictions
+[validationPredictions, validationScores] = kfoldPredict(partitionedModel); %#ok<NASGU,ASGLU>
 
-% Validation accuracy
+% Compute validation accuracy
 validationAccuracy = 1 - kfoldLoss(partitionedModel, 'LossFun', 'ClassifError');
 
 end
 
 function [labels, scores] = localThresholdPredict(tbl, predictorExtractionFcn, model, pvcThreshold)
-% Return labels/scores with custom threshold; PVC score column chosen by class name
+% Return labels and scores applying a custom threshold. Assumes the PVC score
+% resides in the column corresponding to class name 'PVC'. If the score
+% columns align with class names, then scores(:, idxPVC) is the PVC score.
     X = predictorExtractionFcn(tbl);
     [rawLabels, rawScores] = predict(model, X);
-    % Find PVC column
+    % Locate the PVC score column
     classNames = model.ClassNames; % {'Other','PVC'}
     if iscell(classNames)
         pvcIdx = find(strcmp(classNames, 'PVC'), 1);
@@ -139,7 +180,7 @@ function [labels, scores] = localThresholdPredict(tbl, predictorExtractionFcn, m
         pvcIdx = find(classNames == 'PVC', 1);
     end
     if isempty(pvcIdx)
-        % Fallback: default to second column
+        % Fallback: use the second column by default
         pvcIdx = min(size(rawScores,2), 2);
     end
     pvcScore = rawScores(:, pvcIdx);

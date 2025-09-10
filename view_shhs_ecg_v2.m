@@ -1,20 +1,67 @@
 function view_shhs_ecg_v2()
+% =================================================================================================
 % File: view_shhs_ecg_v2.m
-% Type: Function (GUI tool)
-% Description:
-%   Display filtered ECG and overlay Q/R/S/T detection markers; bottom axis shows raw ECG with rpoints annotations (if available).
+% Overview:
+%   SHHS ECG (QRS/T) visualization viewer, edition v2, with interactive controls.
+%   Dual synchronized axes: top shows filtered ECG for detection with Q/R/S/T markers; bottom shows raw ECG and (if available) CSV R points with types.
+%
+% Responsibilities:
+%   1. Load a single SHHS EDF file (user interactive selection) and extract the ECG channel (match ECG/EKG, supports cell array or numeric column).
+%   2. Preprocess with ecgFilter (mode 2: IIR/enhanced pipeline) to produce the detection signal (aligned with the top display).
+%   3. Call detectAndClassifyHeartbeats to locate beats, convert relative indices to absolute sample indices; supports Q/R/S/T.
+%   4. Attempt to parse corresponding rpoints annotations (multiple filename candidates -rpoint(s).csv, recursive search) and map by seconds or by sampling rate to current fs.
+%   5. Interaction: synchronized zoom/pan, time jump (seconds or hh:mm:ss), adaptive decimation to improve plotting performance.
+%   6. Info bar shows sampling rate, annotated PVC/Other counts, and detected R peak count.
+%
+% I/O:
+%   External call: no input parameters; run directly to launch the GUI.
+%   User input: menu "Open EDF..."; optional time jump edit; mouse wheel/drag for zoom/pan.
+%   Data source: SHHS EDF plus optional CSV in annotations-rpoints folder (fields seconds / Type / rpoint).
+%   Return: none (interactive figure output only).
+%
+% Key implementation notes:
+%   - Centralized state struct S holds data/handles, passed across callbacks via guidata.
+%   - Adaptive sampling: decimate by dynamic step size based on window length and displayMaxPoints to balance performance and clarity.
+%   - Marker throttling: limit the number of Q/R/S/T and bottom R/type markers via displayMaxMarkers to prevent GUI slowdowns.
+%   - Time jump: parse seconds or hh:mm:ss -> center around the time with a half-window; auto-extend to ensure minimal visible width.
+%   - Annotation parsing: prefer seconds; if missing, use rpoint indices with fs mapping; fall back to default fs if sampling rate is missing.
+%   - Q/R/S/T index sanitization: sanitizeIndices removes out-of-range/NaN and ensures integers.
+%
+% Robustness and safeguards:
+%   - EDF read failure shows a dialog and aborts without breaking existing state.
+%   - Channel search uses multiple strategies (exact ECG match and fuzzy contains ecg/ekg).
+%   - Accepts ECG as cell array or numeric vector; attempt str2num conversion for textual numbers.
+%   - Beat detection wrapped with try/catch; log warnings only and keep the GUI responsive.
+%   - CSV multiple path candidates plus recursive search; lowercase variable-name matching avoids case issues.
+%   - Edge cases: empty data, empty window range, or constant signals trigger y-axis expansion for visibility.
+%   - Limit text label count (maxLabels) to avoid rendering degradation.
+%
+% Performance notes:
+%   - Plot decimation (limit points and markers).
+%   - Use drawnow limitrate to reduce refresh frequency during rapid zooming.
+%   - Filter and redraw only markers/labels within the visible window.
+%
+% Suitable/Not suitable:
+%   Suitable: manual QC of a single file, debugging beat detection/annotation quality, quick validation of QRS/T localization.
+%   Not suitable: batch statistics or offline processing (should use scripted pipelines).
+%
+% Changelog:
+%   2025-08-30 Initial standardized header comment (Chinese version); functionality unchanged.
+%   2025-09-09 Full English translation of comments and UI strings; functionality unchanged.
+%
 % Usage:
-%   Run in MATLAB: view_shhs_ecg_v2
+%   >> view_shhs_ecg_v2
+%   After launching the GUI, open an EDF via the menu. Use the jump box to enter "3600" or "01:00:00" for quick navigation.
+%
 % Dependencies:
-%   edfread, ecgFilter, detectAndClassifyHeartbeats, and helper functions within this file
-% Maintainer: N/A  |  Version: 1.0  |  Date: 2025-08-26
-
+%   ecgFilter.m, detectAndClassifyHeartbeats.m, and their feature/classification support files.
+% =================================================================================================
 	% State
 	S = struct();
 	S.fs_default = 125;
 	S.fs = S.fs_default;
-	S.ecgDispFull = [];   % Display/detection signal (filtered, top axis)
-	S.ecgRaw = [];        % Raw unfiltered ECG (bottom axis)
+	S.ecgDispFull = [];   % Display/detection waveform (filtered, shown on top)
+	S.ecgRaw = [];        % Raw, unfiltered ECG (shown on bottom)
 	S.tFull = [];
 	S.qIdxFull = []; S.rIdxFull = []; S.sIdxFull = []; S.tIdxFull = [];
 	S.qTimesFull = []; S.rTimesFull = []; S.sTimesFull = []; S.tTimesFull = [];
@@ -34,11 +81,11 @@ function view_shhs_ecg_v2()
 	uimenu(mFile, 'Label','Clear', 'Callback', @(src,evt)onClear(src));
 	uimenu(mFile, 'Label','Exit', 'Callback', @(~,~)close(S.fig));
 
-	% Navigate menu: go to time
+	% Navigation menu: go to time
 	mNav = uimenu(S.fig, 'Label','Navigate');
 	uimenu(mNav, 'Label','Go to time...', 'Accelerator','G', 'Callback', @(src,evt)onGotoPrompt(src));
 
-	% Create a panel for two axes, reserving bottom space for info bar
+	% Create a panel to host two axes, reserving bottom space for the info bar
 	S.axPanel = uipanel('Parent', S.fig, 'Units','normalized', 'Position',[0.05 0.10 0.90 0.85], ...
 		'BorderType','none', 'BackgroundColor','w');
 	S.tiled = tiledlayout(S.axPanel, 2, 1, 'TileSpacing','compact', 'Padding','compact');
@@ -57,7 +104,7 @@ function view_shhs_ecg_v2()
 	S.hRBottom = plot(S.axBottom, NaN, NaN, 'rv', 'MarkerSize',6, 'LineWidth',1.0);
 	S.hTxtBottom = gobjects(0);
 
-	% Linked axes and interactions
+	% Axes linkage and interactions
 	linkaxes([S.axTop, S.axBottom], 'x');
 	S.zoomObj = zoom(S.fig); S.zoomObj.Motion='both'; S.zoomObj.Enable='on';
 	S.panObj = pan(S.fig); S.panObj.Enable='on';
@@ -66,18 +113,18 @@ function view_shhs_ecg_v2()
 
 	guidata(S.fig, S);
 
-	% Bottom info bar (file name, sampling rate, annotations and detection stats)
+	% Bottom info bar (file name, sampling rate, annotation and detection stats)
 	S = guidata(S.fig);
 	S.hInfoText = uicontrol(S.fig, 'Style','text', 'Units','normalized', ...
 		'Position',[0.02 0.01 0.62 0.06], 'BackgroundColor','w', ...
 		'HorizontalAlignment','left', 'FontSize',10, 'String','');
-	% Bottom quick jump controls
+	% Bottom quick-jump controls
 	S.hJumpLabel = uicontrol(S.fig, 'Style','text', 'Units','normalized', ...
 		'Position',[0.64 0.01 0.10 0.06], 'BackgroundColor','w', ...
 		'HorizontalAlignment','right', 'String','Go to time:');
 	S.hJumpEdit = uicontrol(S.fig, 'Style','edit', 'Units','normalized', ...
 		'Position',[0.75 0.02 0.10 0.04], 'String','00:00:10', ...
-		'TooltipString','Enter seconds or hh:mm:ss. Press Enter or click Go.', ...
+		'TooltipString','Enter seconds or hh:mm:ss, press Enter or click "Go"', ...
 		'KeyPressFcn', @(obj,evt)onJumpEditKey(obj,evt));
 	S.hJumpBtn = uicontrol(S.fig, 'Style','pushbutton', 'Units','normalized', ...
 		'Position',[0.86 0.02 0.10 0.04], 'String','Go', ...
@@ -97,7 +144,7 @@ function view_shhs_ecg_v2()
 			errordlg(sprintf('edfread failed:\n%s', ME.message), 'Read Error');
 			return;
 		end
-		% Get ECG channel
+		% Locate ECG channel
 		vn = TT.Properties.VariableNames;
 		iEcg = find(strcmp(vn,'ECG'),1); if isempty(iEcg), vl = lower(vn); iEcg = find(contains(vl,'ecg')|contains(vl,'ekg'),1,'first'); end
 		if isempty(iEcg), errordlg('ECG channel not found.','Missing Channel'); return; end
@@ -116,19 +163,19 @@ function view_shhs_ecg_v2()
 		elseif isnumeric(ecgCol)
 			ecg = ecgCol(:);
 		else
-			errordlg(sprintf('ECG channel type not supported: %s', class(ecgCol)), 'Unsupported Type'); return;
+			errordlg(sprintf('Unsupported ECG channel type: %s', class(ecgCol)), 'Unsupported Type'); return;
 		end
 		ecg = double(ecg);
 		fs = S.fs_default; t = (0:numel(ecg)-1)'/fs;
-		% Display/detection signals: top uses filtered signal, bottom shows raw
+		% Display/detection signal: top uses filtered signal; bottom shows raw signal
 		try
 			ecgFiltered = ecgFilter(ecg, fs, 2, 0);
 		catch ME
 			errordlg(sprintf('Filtering failed:\n%s', ME.message), 'Filtering Error'); return;
 		end
-		detSig = ecgFiltered; % 顶部显示与检测信号一致
+		detSig = ecgFiltered; % Top display and detection signal are the same
 
-		% Perform QRS detection (see main_v3 flow)
+		% Run QRS detection (reference main_v3 flow)
 		ATRTIMED = []; ANNOTD = {};
 		qIdxAbs = []; %#ok<NASGU>
 		rIdxAbs = []; %#ok<NASGU>
@@ -136,7 +183,7 @@ function view_shhs_ecg_v2()
 		try
 			[~, beatInfo, ~] = detectAndClassifyHeartbeats(detSig, ATRTIMED, ANNOTD, fs);
 			if ~isempty(beatInfo)
-				% Compatibility for struct array fields
+				% Compatible with struct array fields
 				nb = numel(beatInfo);
 				qIdxAbs = nan(nb,1); rIdxAbs = nan(nb,1); sIdxAbs = nan(nb,1); tIdxAbs = nan(nb,1);
 				for ii = 1:nb
@@ -195,13 +242,13 @@ function view_shhs_ecg_v2()
 		elseif ~isempty(S.rSecsFull)
 			numTotal = numel(S.rSecsFull);
 		end
-		infoStr = sprintf('File: %s | fs: %g Hz | Annotations: PVC=%d, Other=%d, Total beats=%d | Detected R-peaks=%d', ...
+		infoStr = sprintf('File: %s | Sampling rate: %g Hz | Annotations: PVC=%d, Other=%d, Total beats=%d | Detected R peaks=%d', ...
 			[edfBaseName edfExt], fs, numPVC, numOther, numTotal, numDetectedR);
 		if isfield(S,'hInfoText') && ishghandle(S.hInfoText)
 			set(S.hInfoText, 'String', infoStr);
 		end
 
-		% Initial 30 s window
+		% Initial 30-second window
 		xStart = t(1); xEnd = min(t(end), xStart + 30);
 		xlim(S.axTop, [xStart xEnd]); xlim(S.axBottom, [xStart xEnd]);
 		% Top legend
@@ -241,7 +288,7 @@ function view_shhs_ecg_v2()
 		segLen = iEnd-iStart+1; step = max(1, ceil(segLen / S.displayMaxPoints)); idx = iStart:step:iEnd;
 		xp = t(idx); ypTop = S.ecgDispFull(idx); ypBottom = S.ecgRaw(idx);
 		set(S.hTop,'XData',xp,'YData',ypTop); set(S.hBottom,'XData',xp,'YData',ypBottom);
-		% Top QRS markers
+		% QRS markers on top axis
 		if ~isempty(S.rIdxFull)
 			mask = S.rIdxFull>=iStart & S.rIdxFull<=iEnd; rIdxV=S.rIdxFull(mask); rTimesV = S.rTimesFull(mask);
 			mstep = max(1, ceil(nnz(mask) / S.displayMaxMarkers)); rIdxV = rIdxV(1:mstep:end); rTimesV = rTimesV(1:mstep:end);
@@ -263,7 +310,7 @@ function view_shhs_ecg_v2()
 		else
 			set(S.hS,'XData',NaN,'YData',NaN);
 		end
-		% Top T-wave markers
+		% T-wave markers on top axis
 		if ~isempty(S.tIdxFull)
 			maskT = S.tIdxFull>=iStart & S.tIdxFull<=iEnd; tIdxV=S.tIdxFull(maskT); tTimesV=S.tTimesFull(maskT);
 			mstepT = max(1, ceil(nnz(maskT) / S.displayMaxMarkers)); tIdxV=tIdxV(1:mstepT:end); tTimesV=tTimesV(1:mstepT:end);
@@ -271,7 +318,7 @@ function view_shhs_ecg_v2()
 		else
 			set(S.hT,'XData',NaN,'YData',NaN);
 		end
-		% Bottom R and types (from CSV if present)
+		% Bottom R and types (from CSV, if present)
 		if ~isempty(S.rSecsFull)
 			maskRB = S.rSecsFull>=x1 & S.rSecsFull<=x2;
 			rTimesB = S.rSecsFull(maskRB); rTypesB = S.rTypesFull(maskRB);
@@ -293,7 +340,7 @@ function view_shhs_ecg_v2()
 	function onGotoPrompt(src)
 		fig = ancestor(src,'figure'); S = guidata(fig);
 		if isempty(S) || isempty(S.tFull)
-			errordlg('Please open an EDF file first.','No data'); return;
+			errordlg('Please open an EDF file first.','No Data'); return;
 		end
 		try
 			defStr = get(S.hJumpEdit,'String');
@@ -340,7 +387,7 @@ function view_shhs_ecg_v2()
 		if isscalar(partsStr)
 			secs = NaN; return;
 		end
-		% Allow fractional seconds in the last part
+		% Allow fractional seconds in the last segment
 		lastSec = str2double(partsStr(end));
 		if isnan(lastSec), secs = NaN; return; end
 		if numel(partsStr)==2
@@ -358,23 +405,23 @@ function view_shhs_ecg_v2()
 	function doJumpTime(fig, timeStr)
 		S = guidata(fig);
 		if isempty(S) || isempty(S.tFull)
-			errordlg('Please open an EDF file first.','No data'); return;
+			errordlg('Please open an EDF file first.','No Data'); return;
 		end
 		t = S.tFull; fs = S.fs;
 		sec = parseTimeStr(timeStr);
 		if isempty(sec) || isnan(sec)
-			beep; warndlg('Unable to parse time. Please enter seconds or hh:mm:ss.','Invalid time format'); return;
+			beep; warndlg('Failed to parse time. Please enter seconds or hh:mm:ss format.','Invalid time format'); return;
 		end
-		% Limit range
+		% Clamp target time within bounds
 		target = max(t(1), min(t(end), sec));
 		halfW = max(1/fs, S.jumpWindowSec/2);
 		x1 = max(t(1), target - halfW);
 		x2 = min(t(end), target + halfW);
 		if x2 <= x1, x2 = min(t(end), x1 + max(1/fs, S.jumpWindowSec)); end
-		% Interval indices
+		% Window indices
 		i1 = max(1, floor(x1*fs)+1);
 		i2 = min(numel(t), ceil(x2*fs)+1);
-		% Compute Y-limits and pad
+		% Compute Y limits and pad
 		if ~isempty(S.ecgDispFull)
 			ySegTop = S.ecgDispFull(i1:i2);
 			yMinT = min(ySegTop); yMaxT = max(ySegTop);
@@ -508,5 +555,3 @@ function view_shhs_ecg_v2()
 	end
 
 end
-
-

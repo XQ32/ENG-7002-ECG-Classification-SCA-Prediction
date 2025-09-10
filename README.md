@@ -1,183 +1,262 @@
-# ENG 7002 ECG Classification & SCA Prediction
+# ENG 7002 | ECG Beat Classification & SCA Risk Prediction (SHHS1)
 
-This project provides a complete MATLAB pipeline for SHHS1 ECG signal processing, including filtering, Q/R/S/T delineation, beat quality (SQI) assessment, feature extraction, PVC vs. Other beat classification, and sudden cardiac arrest (SCA) risk–related post‑PVC window aggregation and modeling. Interactive visualization GUIs are included.
+This project provides a complete MATLAB pipeline for single-lead ECG processing on SHHS1: preprocessing, Q/R/S/T delineation, beat quality assessment (SQI), feature extraction, beat classification (PVC vs Other), and SCA (sudden cardiac arrest) risk modeling based on post-PVC recovery dynamics. Interactive visualization GUIs are included.
 
-## 1. Top-Level Code & Directory Structure (Text View)
+## 1. Repository Structure
 
 ```
 ENG-7002-ECG-Classification-SCA-Prediction/
 ├─ README.md                        ← Project documentation (this file)
-├─ assessBeatsQuality.m             ← Beat template SQI evaluation (template build + correlation threshold gating)
-├─ detectAndClassifyHeartbeats.m    ← Main Q/R/S/T detection + annotation matching + SQI filtering (calls assessBeatsQuality)
-├─ ecgFilter.m                      ← ECG preprocessing (notch / baseline removal / low-pass / smoothing / QRS enhancement)
-├─ extractHeartbeatFeatures.m       ← Derive RR / amplitude / duration / area features from beatInfo
-├─ trainBeatsClassifier.m           ← Train PVC vs Other beat classifier (AdaBoost)
-├─ generate_beats_classifier.m      ← Script: batch feature extraction + train/evaluate/save beat classifier
-├─ predict_shhs1_all.m              ← Script: run detection + features + prediction for all EDFs using trained model
-├─ generate_sca_classifier.m        ← Script: aggregate 5 s post-PVC features from *_info.mat (predPVCIndices, etc.) and train SCA model
-├─ view_shhs_ecg_v1.m               ← GUI: raw / filtered ECG + annotated R peaks
-├─ view_shhs_ecg_v2.m               ← GUI: filtered ECG + Q/R/S/T markers (internal detection); bottom raw + annotations
-├─ view_shhs_ecg_v3.m               ← GUI: integrated viewer + on‑the‑fly feature extraction + model inference (PVC / risk)
-├─ generate_sca_classifier.m        ← SCA classifier training script (extensive window feature engineering)
-├─ mcode/                           ← External / auxiliary WFDB & HRV toolkit (PhysioNet MATLAB tools + examples)
-│  ├─ *.m / *.jar / example/ ...    ← rdann, rdsamp, gqrs, ecgpuwave etc. (not directly invoked in core pipeline yet)
-│  └─ html/                         ← Corresponding function HTML help
-└─ results/                         ← Generated output (models & feature tables, created at runtime)
+├─ ecgFilter.m                      ← ECG preprocessing (notch/baseline/low-pass/smoothing/QRS enhancement)
+├─ detectAndClassifyHeartbeats.m    ← R/Q/S/T detection and beat info assembly (with optional SQI)
+├─ assessBeatsQuality.m             ← Template-based SQI (correlation + micro shift alignment)
+├─ extractHeartbeatFeatures.m       ← Extract RR/amplitude/duration/area features from beatInfo
+├─ trainBeatsClassifier.m           ← Train PVC vs Other classifier (AdaBoost)
+├─ generate_beats_classifier.m      ← Batch feature extraction + train/evaluate/save the beat classifier
+├─ predict_shhs1_all.m              ← Predict PVC on all EDFs and write *_info.mat
+├─ generate_sca_classifier_v3.m     ← v3 SCA risk modeling using only *_info.mat (recovery dynamics features)
+├─ view_shhs_ecg_v2.m               ← Visualization: filtered waveform + Q/R/S/T (top), raw + annotations (bottom)
+├─ view_shhs_ecg_v3.m               ← Visualization: integrated view/classify/navigate + quick SCA risk
+├─ mcode/                           ← PhysioNet WFDB MATLAB tools and examples (external toolkit)
+└─ results/                         ← Runtime outputs (models, feature tables; created on first run)
 ```
 
-## 2. Main Data Flow & Call Relationships (Bottom → Top)
+## 2. Core Data Flow and Call Relationships
 
-### 2.1 Low-Level Signal Processing & Detection
+### 2.1 Signal Preprocessing and Beat Detection
 ```
 ecgFilter
-	├─ (internal) apply_FIR_filter / apply_IIR_filter / apply_enhanced_pipeline
-	└─ Produces filtered ECG (optionally QRS‑enhanced signal)
+	├─ Internals: FIR high-pass / IIR high-pass / enhanced pipeline (dual median + high-pass)
+	└─ Output: filtered ECG (method=3 also exports a QRS-enhanced signal)
 
-detectAndClassifyHeartbeats (core beat detection + structured beatInfo)
-	├─ local_detect_r_hybrid_fast (hybrid R strategy)
-	├─ local_remove_t_as_r (remove T misdetections)
-	├─ local_detect_qs (Q/S + QRS boundaries)
+detectAndClassifyHeartbeats (core detection + structured beatInfo)
+	├─ local_detect_r_hybrid_fast (R candidates fusion)
+	├─ local_remove_t_as_r (suppress T-as-R)
+	├─ local_detect_qs (Q/S + QRS onset/offset)
 	├─ local_detect_twave (T tagging)
-	├─ assessBeatsQuality (template SQI gating)
-	└─ Output: heartbeatSegments, beatInfo (segmentStartIndex / rIndex / qIndex / sIndex / tIndex / qrsOn/Off)
+	├─ assessBeatsQuality (optional SQI gate)
+	└─ Output: heartbeatSegments, beatInfo (with indices and boundaries)
 
-assessBeatsQuality (beat segment quality scoring)
-	├─ Build templates: Other / PVC / Global (subject to minimum counts)
-	├─ maxCorrWithShift sliding alignment correlation
-	└─ Output: isGood mask + corrValues + template class used
+assessBeatsQuality (template-based quality scoring)
+	├─ Build templates: Other / PVC / Global (fallback when insufficient)
+	├─ Max correlation with ±maxShift tolerance
+	└─ Output: isGood mask / correlation values / template class used
 
 extractHeartbeatFeatures
 	├─ Input: beatInfo + fs
-	├─ Compute: RR intervals, Q/R/S amplitudes, QRS duration, QRS area (prefer qrsOn/Off)
-	└─ Output: featureTable (includes BeatType)
+	├─ Compute: RR_prev/next, Q/R/S amplitudes, QRS duration, QRS area (prefer qrsOn/Off)
+	└─ Output: featureTable (includes BeatType label)
 ```
 
 ### 2.2 Beat Classification (PVC vs Other)
 ```
 generate_beats_classifier (script)
-	├─ Enumerate EDF + rpoint annotations
+	├─ Enumerate EDF + rpoints annotations
 	├─ ecgFilter → detectAndClassifyHeartbeats → extractHeartbeatFeatures
-	├─ Merge all features → stratified split (train/test)
-	├─ trainBeatsClassifier (AdaBoost with optional cost & threshold moving)
+	├─ Merge features → stratified train/test split
+	├─ trainBeatsClassifier (AdaBoost; optional cost matrix and threshold moving)
 	├─ Evaluate: confusion matrix / metrics
 	└─ Save: trainingFeatureTable.mat / testingFeatureTable.mat / trainedClassifier_latest.mat
 
 trainBeatsClassifier
-	├─ Class frequency weights + optional cost matrix
-	├─ fitcensemble (AdaBoostM1 + templateTree)
-	├─ Optional threshold-adjusted predictFcn wrapper
+	├─ Class-frequency weighting + optional cost matrix
+	├─ fitcensemble (AdaBoostM1 + decision trees)
+	├─ Optional threshold-moving predictFcn wrapper
 	└─ Output: trainedClassifier struct + 10-fold CV accuracy
 ```
 
-### 2.3 Batch Prediction & Persistence
+### 2.3 Batch Prediction and Persistence
 ```
 predict_shhs1_all (script)
-	├─ Load trainedClassifier_latest.mat
-	├─ For each EDF: ecgFilter → detectAndClassifyHeartbeats (no annotations) → extractHeartbeatFeatures
-	├─ Median-impute missing numeric features → model predict (optional external PVC threshold override)
-	└─ Save per-record *_beats_features_pred.mat (allBeatInfo / raw & imputed features / predicted labels / stats)
+	├─ Load the trained beat classifier
+	├─ For each EDF: ecgFilter → detectAndClassifyHeartbeats (no external labels) → extractHeartbeatFeatures
+	├─ Median-impute missing numeric features → model prediction (optional PVC probability threshold override)
+	└─ Save {record}_info.mat (predPVCIndices, patientVital, and required vectors)
 ```
 
-### 2.4 SCA Risk Feature Aggregation & Classification
+### 2.4 SCA Risk Feature Aggregation and Modeling (v3)
 ```
-generate_sca_classifier (script)
-	├─ Depends on *_info.mat (predPVCIndices, patientVital)
-	├─ Read EDF → ecgFilter → detectAndClassifyHeartbeats for global R series
-	├─ For each PVC build post-PVC 5 s window features (stat / rhythm / morphology)
-	├─ Aggregate feature table → train (local_train_sca_classifier: AdaBoost + weights + cost + 5-fold CV)
-	├─ Threshold moving / evaluation (accuracy, sensitivity, specificity, AUC)
-	└─ Save post_ectopic_features.mat / sca_classifier_post_ectopic.mat
+generate_sca_classifier_v3 (script)
+	├─ Uses only *_info.mat generated by predict_shhs1_all (no EDF reading)
+	├─ Build per-PVC variable-length recovery dynamics features (RR/T/QTc half-life, time constant, overshoot, oscillation, stalls, HR acceleration, etc.)
+	├─ Quality gates (min PVC count, non-PVC SQI ratio)
+	├─ Stratified split + imbalance-friendly models (Logit/Gentle/AdaBoost/Bag; default LogitBoost)
+	├─ Cost matrix and threshold search (optimize recall/F1 of Dead-class)
+	└─ Artifacts: post_ectopic_features_v3.mat / SCA_trainingFeatureTable_v3.mat / sca_classifier_v3.mat
 ```
 
-### 2.5 Visualization GUIs
+### 2.5 Visualization Tools (GUI)
 ```
-view_shhs_ecg_v1
-	├─ Open EDF → ecgFilter (method 2, skip notch) → plot raw & inverted filtered signals
-	├─ Try load rpoint annotations (seconds / indices) → show R markers & labels
-
 view_shhs_ecg_v2
-	├─ Open EDF → ecgFilter → detectAndClassifyHeartbeats (no annotations) for Q/R/S/T
-	├─ Top: detection signal with Q/R/S/T markers; bottom: raw + R annotations
+	├─ Load EDF → ecgFilter → detectAndClassifyHeartbeats (no annotations)
+	├─ Top: detection signal with Q/R/S/T; bottom: raw ECG + CSV annotations (if available)
 
 view_shhs_ecg_v3
-	├─ Advanced window / navigation / batch ops
-	├─ Buttons trigger detectAndClassifyHeartbeats + extractHeartbeatFeatures
-	├─ Load trainedClassifier_latest for online PVC classification
-	└─ Can be extended with SCA risk model
+	├─ Window browsing, jump, filtering (PVC/Other/All), prev/next navigation, selection highlight
+	├─ One-click detect + features + load beat classifier for online PVC inference
+	└─ Quick SCA risk (load trained v3 model)
 ```
 
-## 3. End-to-End Typical Workflow
+## 3. Quick Start (End-to-End)
 ```
-1. (Optional) Run generate_beats_classifier.m to train/update PVC model
-2. Run predict_shhs1_all.m to produce *_beats_features_pred.mat for all records
-3. Generate *_info.mat (external/preceding script producing predPVCIndices & patientVital)
-4. Run generate_sca_classifier.m to train SCA risk model
-5. Use view_shhs_ecg_v2 / v3 for interactive inspection & validation
+1) Prepare data directories (see “Data Preparation”).
+2) Train beat classifier: run `generate_beats_classifier.m` (or reuse `results/trainedClassifier_latest.mat`).
+3) Batch prediction: run `predict_shhs1_all.m` to write `{record}_info.mat` for each EDF.
+4) Train SCA risk model: run `generate_sca_classifier_v3.m` (consumes only *_info.mat).
+5) Daily QC/inspection: run `view_shhs_ecg_v2.m` or `view_shhs_ecg_v3.m`.
 ```
 
 ## 4. Key Data Structures
 ```
 beatInfo(i):
-	.beatType          Beat label (PVC / Other; default Other if no annotations)
-	.segment           Beat waveform segment
+	.beatType          Beat label (PVC/Other; defaults to Other if no external labels)
+	.segment           Beat segment waveform
 	.segmentStartIndex Segment start (global sample index)
-	.rIndex/qIndex/sIndex/tIndex  Indices within segment
-	.qrsOnIndex/.qrsOffIndex      QRS onset/offset (segment)
-	.sqiIsGood / .sqiCorr / .sqiTemplateClass  SQI quality metrics
+	.rIndex/qIndex/sIndex/tIndex  Indices within the segment
+	.qrsOnIndex/.qrsOffIndex      QRS onset/offset (within the segment)
+	.sqiIsGood/.sqiCorr/.sqiTemplateClass  SQI quality info
 
 featureTable row:
 	RR_Prev / RR_Post / R_Amplitude / Q_Amplitude / S_Amplitude / QRS_Duration / QRS_Area / BeatType
 ```
 
-### 4.1 Beat-Level Features Used in `generate_beats_classifier.m`
-Source: output of `extractHeartbeatFeatures` + BeatType label; `trainBeatsClassifier` defines `predictorNames`.
+### 4.1 Beat-Level Features (for `generate_beats_classifier.m`)
+From `extractHeartbeatFeatures` + BeatType; `trainBeatsClassifier` expects the following `RequiredVariables`.
 ```
-Predictor (numeric) columns:
-	RR_Prev          Previous RR interval (s)
-	RR_Post          Following RR interval (s)
-	R_Amplitude      R peak amplitude (raw segment value)
-	Q_Amplitude      Q amplitude
-	S_Amplitude      S amplitude
-	QRS_Duration     QRS duration (prefer qrsOn/off else fallback)
-	QRS_Area         Absolute QRS area (simple integral)
+Predictors (numeric):
+	RR_Prev, RR_Post, R_Amplitude, Q_Amplitude, S_Amplitude, QRS_Duration, QRS_Area
 Label:
-	BeatType (PVC / Other)
+	BeatType (PVC/Other)
 ```
 
-### 4.2 Record-Level (Post-PVC 5 s) Feature Set in `generate_sca_classifier.m`
-The script builds per-PVC window primitive metrics, then applies statistical aggregation (mean / std / median / min / max) and adds derived ratio / proportion / variability indicators. Final predictors are numeric columns excluding `record`, `pvc_r_index` (if present), and the response `patientVital` (selected by `local_training_columns`).
+### 4.2 Record-Level (Post-PVC Recovery) Features (`generate_sca_classifier_v3.m`)
+For each PVC, the script builds recovery series primitives (RR/T/QTc), applies statistical aggregation (mean/std/median/min/max), and derives ratio/proportion/instability metrics, then trains a binary model (Alive=1 / Dead=0).
 
-Primitive per-window features (each PVC window):
+Typical primitives/derived examples:
 ```
-RR_Pre, RR_Post1, RR_Post2
-HRT_TO = (RR_Post1 - RR_Pre)/RR_Pre        (Heart Rate Turbulence Onset approximation)
-HRT_TS = (RR_Post2 - RR_Pre)/2             (Turbulence Slope approximation)
-QRS_Dur_PVC, R_Amp_PVC
-Beats_in_5s (R count within window)
-HR_Pre = 60 / RR_Pre
-HR_Post1 = 60 / RR_Post1
-HR_5s = Beats_in_5s / windowSeconds * 60
-HR_Accel = HR_Post1 - HR_Pre
-CompRatio = RR_Post1 / RR_Pre
-PVC_Interval (adjacent PVC interval series)
+RR_Pre/RR_Post1/RR_Post2, HRT_TO/HRT_TS, QRS_Dur_PVC, R_Amp_PVC, Beats_in_5s,
+HR series (HR_Pre/HR_Post1/HR_5s/HR_Accel), CompRatio, PVC_Interval,
+RR recovery half-lives/time constant/overshoot/oscillation/stalls, late instability variance,
+T-amplitude and QTc recovery, etc.
 ```
 
-Statistical aggregation applied to each numeric series (except certain proportion / derived only fields):
-```
-<Name>_mean, <Name>_std, <Name>_median, <Name>_min, <Name>_max
-Examples: RR_Pre_mean, RR_Pre_std, ..., HRT_TO_mean, QRS_Dur_PVC_max, HR_5s_median
+Aggregations include `<Name>_mean/_std/_median/_min/_max`; proportions/variability include
+`PVCs_per_hour, HRT_TO_neg_frac, QRS_Prolonged_frac, RR_*_CV/RMSSD, CompRatio_*, record_pvc_count`, etc.
+
+Response variable: `patientVital` (1=Alive, 0=Dead).
+
+## 5. Environment & Dependencies
+
+- MATLAB R2021b or later recommended (uses edfread, filtfilt, movmedian, medfilt1, etc.)
+- Toolboxes (recommended):
+  - Signal Processing Toolbox (filters/median/SG filter)
+  - Statistics and Machine Learning Toolbox (fitcensemble, etc.)
+- Windows/macOS/Linux supported. This repo ships `mcode/` (PhysioNet WFDB MATLAB tools). The main pipeline does not strictly depend on WFDB binaries but they’re useful for extensions.
+
+On first run, consider:
+
+```matlab
+addpath(genpath(pwd));
+savepath; % optional
 ```
 
-Additional derived / proportion / variability metrics:
+## 6. Data Preparation
+
+Place the following structure under the repository root (datasets are not included in the repo):
+
 ```
-PVCs_per_hour                 PVC count per hour
-HRT_TO_neg_frac               Fraction with HRT_TO < 0
-QRS_Prolonged_frac            Fraction QRS_Dur_PVC > 0.12 s
-RR_Pre_CV, RR_Post1_CV        RR coefficient of variation (std/mean)
-RR_Pre_RMSSD, RR_Post1_RMSSD  RR RMSSD (short-term variability)
-HR_Accel_*                    Heart rate acceleration stats (mean/std/median/min/max)
-CompRatio_*                   Compensatory ratio stats
-PVC_Interval_*                PVC interval stats
-record_pvc_count              Total PVC count in record
-patientVital                  Label (1=Alive, 0=Dead) — response variable
+shhs/
+  polysomnography/
+    edfs/
+      shhs1/
+        shhs1-XXXXXX.edf            # multiple EDFs
+    annotations-rpoints/
+      shhs1/
+        shhs1-XXXXXX-rpoint.csv     # R-point annotations (Type/seconds/…), for supervised training
+  datasets/
+    shhs-cvd-summary-dataset-0.21.0.csv  # contains nsrrid and vital (0=Dead,1=Alive)
+results/                               # runtime outputs (created if missing)
 ```
+
+Note: SHHS1 data are typically already 60 Hz notched. Filtering defaults to `power_line_freq=0` to avoid double-notching.
+
+## 7. How to Run
+
+Run these in MATLAB (ideally step by step):
+
+### 7.1 Train the Beat Classifier (PVC vs Other)
+
+```matlab
+% Adjust test split, random seed, grid search switches at the top of the script
+generate_beats_classifier
+```
+
+Outputs under `results/`:
+- `trainingFeatureTable.mat` / `testingFeatureTable.mat`
+- `trainedClassifier_latest.mat` (and timestamped backups)
+
+### 7.2 Batch Prediction (Generate *_info.mat)
+
+```matlab
+predict_shhs1_all
+```
+
+For each EDF, writes `{record}_info.mat` (in the same folder), containing at least:
+`predPVCIndices, patientVital, fs, recordNumSamples, rGlobalAll, isPVCBeat, qrs_dur_vec, r_amp_vec, sqi_vec, t_amp_vec, tGlobalIndices`.
+
+### 7.3 Train the SCA Risk Model (v3, *_info.mat only)
+
+```matlab
+generate_sca_classifier_v3
+```
+
+Outputs under `results/`:
+- `post_ectopic_features_v3.mat`
+- `SCA_trainingFeatureTable_v3.mat` / `SCA_testingFeatureTable_v3.mat`
+- `sca_classifier_v3.mat`
+
+### 7.4 Visualization (QC/Exploration)
+
+```matlab
+view_shhs_ecg_v2    % dual plots: detection markers + raw/annotations
+view_shhs_ecg_v3    % integrated viewing/classification/navigation + quick SCA risk
+```
+
+## 8. Frequently Tuned Parameters (Examples)
+
+- `ecgFilter.m`:
+  - `method_index`: 1=FIR, 2=Butterworth, 3=enhanced pipeline (with QRS enhancement)
+  - `power_line_freq`: 0/50/60 (SHHS1 suggests 0)
+- `detectAndClassifyHeartbeats.m`:
+  - Refractory, energy/slope thresholds, PVC wide-QRS adaptive windows (auto-adapts to fs)
+  - Optional `assessBeatsQuality` (enabled by default)
+- `assessBeatsQuality.m`:
+  - `windowSec`, `bandpassHz`, `minBeatsForTemplate`, correlation thresholds, `maxShiftSec`
+- `generate_beats_classifier.m`:
+  - Split, blacklist, hyperparameter search, threshold moving, cost matrix
+- `predict_shhs1_all.m`:
+  - `pvcThresholdOverride` (higher → higher precision, lower recall)
+- `generate_sca_classifier_v3.m`:
+  - Recovery/baseline params, quality gates, feature selection, threshold search, cost matrix, etc.
+
+## 9. Troubleshooting (FAQ)
+
+- Missing EDF/annotation directories: create `shhs/...` as in “Data Preparation”; scripts log missing paths.
+- edfread errors or missing ECG channel: ensure the EDF exists and contains variable `ECG` (or something including `ecg/ekg`).
+- Missing class during training: if one class is absent, the script falls back to equal weights; check annotations and feature filtering.
+- Missing features at prediction: the script prints missing variable names; keep feature names consistent with `RequiredVariables`.
+- No beats after SQI: relax correlation thresholds or `minBeatsForTemplate` in `assessBeatsQuality`.
+- v3 training skips records: records must pass min PVC count and non-PVC SQI ratio gates (tune at the top of the script).
+
+## 10. License & Acknowledgments
+
+- `mcode/` originates from PhysioNet WFDB MATLAB tools (see their `LICENSE.txt` and `README.txt`).
+- SHHS data belong to the original data provider; follow the appropriate data use agreements.
+
+## 11. Citations (if applicable)
+
+- SHHS (Sleep Heart Health Study) datasets and related publications.
+- WFDB tools and PhysioNet resources.
+
+—
+Questions or contributions are welcome. Feel free to add environment/path/parameter notes to the README and open an issue.

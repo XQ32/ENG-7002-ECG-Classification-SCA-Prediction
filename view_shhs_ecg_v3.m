@@ -1,21 +1,77 @@
 function view_shhs_ecg_v3()
+% =================================================================================================
 % File: view_shhs_ecg_v3.m
-% Type: Function (GUI tool)
-% Description:
-%   Integrated browsing and analysis: predict PVCs with filtering/locating, aggregate post-PVC 5-second features per record,
-%   and estimate record-level SCA risk using a trained model.
+% Overview:
+%   SHHS ECG PVC detection + record-level SCA risk quick assessment GUI (v3).
+%   Single-axis scrollable window + multi-control workflow: Import EDF -> Preprocess -> Beat detection/classification -> PVC filter/navigation -> SCA risk prediction.
+%
+% Main responsibilities:
+%   1. EDF import and ECG channel extraction (supports numeric/cell/string numeric) and basic metadata display (filename/size/duration).
+%   2. Call ecgFilter (mode 2) to create filtered signals for visualization and detection (currently both use mode 2; reserved for future divergence).
+%   3. Call detectAndClassifyHeartbeats to get R/QRS locations and beatInfo/stats.
+%   4. Extract features using extractHeartbeatFeatures -> load beats classifier (results/trainedClassifier_latest.mat) -> predict PVC/Other.
+%   5. Interactions:
+%      - Time window slider browsing and second-level jumping
+%      - Mouse wheel centered zoom / button zoom / reset
+%      - PVC/Other/All filtering view
+%      - Previous/next beat navigation + center on selection + highlight selected beat
+%      - R point markers + labels (PVC red / Other gray)
+%   6. SCA risk: use predicted PVC sequence -> aggregate record-level features on 5s post-PVC windows -> load results/sca_classifier_post_ectopic.mat -> output risk label.
+%   7. Stats display: total beats, PVC/Other counts, selection index, risk result, and actual survival status (from CVD summary dataset).
+%
+% I/O:
+%   External call: no input args; run directly to launch GUI.
+%   User interactions: "Select EDF…", time slider, jump field, zoom in/out/reset, Find PVCs, filter dropdown, prev/next beat, Predict SCA Risk.
+%   Data sources:
+%     - EDF: shhs/polysomnography/edfs
+%     - Beat classifier: results/trainedClassifier_latest.mat
+%     - SCA risk model: results/sca_classifier_post_ectopic.mat
+%     - Patient vital: shhs/datasets/shhs-cvd-summary-dataset-*.csv
+%   Output: no files written (all shown in GUI); internal state kept in the state struct.
+%
+% Key implementation notes:
+%   - Centralized state struct (raw/filtered ECG, beatInfo, predicted labels, filter masks, view window, models, risk result).
+%   - Dual filtered channels reserved (ecgVisFiltered and ecgDetFiltered) for future differentiated params.
+%   - Prediction pipeline: feature consistency check -> missing required features -> fill NaN with median -> call predictFcn.
+%   - Custom 5s post-PVC aggregation: RR, HRT (TO/TS), QRS duration, R amplitude, HR-related, density, recovery, and HRV stats (mean/std/median/min/max).
+%   - Actual vital lookup: parse trailing digits in EDF filename as nsrrid and match with CVD summary (vital 0/1).
+%   - Center-on-selection + dynamic window label when zooming.
+%
+% Robustness & safeguards:
+%   - All core steps (EDF read/filter/detect/classify/SCA predict) wrapped in try/catch with dialogs to avoid crashes.
+%   - Channel search strategies (exact ECG / fuzzy ecg, ekg) and tolerant concatenation for cell/string numerics.
+%   - Missing features / missing model files -> clear errordlg to stop the step.
+%   - NaN feature imputation via sample median (fallback 0) to mitigate outliers.
+%   - Window/index bounds protection: setViewStart clamping; interpY boundary clamp.
+%   - Auto fallback to first filtered index if current selection becomes invalid.
+%
+% Performance notes:
+%   - Local rendering per window: only samples within the current index range.
+%   - Label count equals beats in window; can add thinning if needed (kept straightforward now).
+%   - Mouse wheel scales the window length to avoid global recompute.
+%
+% Use cases / non-use cases:
+%   Use: quick PVC QC for one record, PVC distribution exploration, instant SCA risk indication.
+%   Not for: batch offline evaluation / training set processing (use script pipelines instead).
+%
+% Changelog:
+%   2025-08-30 Added unified header comments (standardized); core logic unchanged.
+%
 % Usage:
-%   Run in MATLAB: view_shhs_ecg_v3
+%   >> view_shhs_ecg_v3
+%   1) Click "Select EDF…" -> 2) "Find PVCs" -> 3) browse via filter/navigation -> 4) "Predict SCA Risk".
+%
 % Dependencies:
-%   edfread, ecgFilter, detectAndClassifyHeartbeats, extractHeartbeatFeatures
-%   and trained models in the results directory
-% Maintainer: N/A  |  Version: 1.0  |  Date: 2025-08-26
-
-    % Shared state
+%   ecgFilter.m, detectAndClassifyHeartbeats.m, extractHeartbeatFeatures.m
+%   results/trainedClassifier_latest.mat
+%   results/sca_classifier_post_ectopic.mat
+%   SHHS CVD summary dataset (vital field)
+% =================================================================================================
+    % 共享状态
     state = struct();
     state.fs = 125;                % default SHHS1 sampling rate
     state.windowSec = 30;          % browsing window length (seconds)
-    state.viewStartSec = 0;        % current window start (seconds)
+    state.viewStartSec = 0;        % current window start (sec)
     state.ecg = [];
     state.ecgFiltered = [];
     state.ecgVisFiltered = [];
@@ -33,7 +89,7 @@ function view_shhs_ecg_v3()
     state.otherMask = [];
     state.filteredBeatIndices = [];
     state.selectedBeatGlobalIdx = 1;
-    state.filterMode = 'All'; % Options: 'All'|'PVC'|'Other'
+    state.filterMode = 'All'; % options: 'All'|'PVC'|'Other'
     state.clsModel = [];      % beat classifier model
     state.scaModel = [];      % SCA risk model
     state.scaResultText = '';
@@ -43,7 +99,7 @@ function view_shhs_ecg_v3()
     ui = buildUI();
     updateUIState('init');
 
-    % Internal: build UI
+    % Internal: build GUI
     function ui = buildUI()
         screenSize = get(0, 'ScreenSize');
         figW = min(1200, screenSize(3) * 0.9);
@@ -52,17 +108,17 @@ function view_shhs_ecg_v3()
             'MenuBar','none', 'ToolBar','none', 'Color','w', 'Units','pixels', ...
             'Position',[100 100 figW figH]);
 
-        % Layout: top main axis, bottom control area
+        % Layout: main axes at top, controls at bottom
         ctrlH = 230;
         ui.ax = axes('Parent', ui.fig, 'Units','pixels', 'Position', [60 ctrlH+30 figW-100 figH-ctrlH-80]);
         set(ui.ax,'Color','w');
         grid(ui.ax,'on'); hold(ui.ax,'on');
         xlabel(ui.ax,'Time (s)'); ylabel(ui.ax,'ECG (a.u.)');
 
-        % Control area (using normalized layout)
+        % Controls panel
         panel = uipanel('Parent', ui.fig, 'Units','pixels', 'Position',[10 10 figW-20 ctrlH-20], 'BorderType','none', 'BackgroundColor','w');
 
-        % Row 1: import and basic info
+        % Row 1: import & basic info
         y1 = ctrlH - 50;
         ui.btnLoad = uicontrol(panel,'Style','pushbutton','String','Select EDF…','Units','pixels', ...
             'Position',[10 y1 120 28],'Callback',@onLoadEDF,'BackgroundColor','w');
@@ -70,12 +126,12 @@ function view_shhs_ecg_v3()
             'Units','pixels','Position',[140 y1 460 22],'BackgroundColor','w');
         ui.textSize = uicontrol(panel,'Style','text','String','Size: -','HorizontalAlignment','left', ...
             'Units','pixels','Position',[610 y1 160 22],'BackgroundColor','w');
-        ui.textFs   = uicontrol(panel,'Style','text','String','fs: -','HorizontalAlignment','left', ...
+        ui.textFs   = uicontrol(panel,'Style','text','String','Sampling rate: -','HorizontalAlignment','left', ...
             'Units','pixels','Position',[780 y1 120 22],'BackgroundColor','w');
         ui.textDur  = uicontrol(panel,'Style','text','String','Duration: -','HorizontalAlignment','left', ...
             'Units','pixels','Position',[910 y1 200 22],'BackgroundColor','w');
 
-        % Row 2: browsing and positioning
+        % Row 2: browsing & positioning
         y2 = ctrlH - 90;
         ui.textWindow = uicontrol(panel,'Style','text','String','Window: 0-30 s','HorizontalAlignment','left', ...
             'Units','pixels','Position',[10 y2 150 22],'BackgroundColor','w');
@@ -93,9 +149,9 @@ function view_shhs_ecg_v3()
         ui.btnResetView = uicontrol(panel,'Style','pushbutton','String','Reset','Units','pixels', ...
             'Position',[1100 y2-2 60 26],'Callback',@onZoomReset,'BackgroundColor','w');
 
-        % Row 3: PVC finding and stats
+        % Row 3: PVC finding & stats
         y3 = ctrlH - 130;
-        ui.btnFindPVC = uicontrol(panel,'Style','pushbutton','String','Find PVC','Units','pixels', ...
+        ui.btnFindPVC = uicontrol(panel,'Style','pushbutton','String','Find PVCs','Units','pixels', ...
             'Position',[10 y3 120 28],'Callback',@onFindPVC,'BackgroundColor','w');
         ui.textBeats = uicontrol(panel,'Style','text','String','Beats: -','HorizontalAlignment','left', ...
             'Units','pixels','Position',[140 y3 200 22],'BackgroundColor','w');
@@ -104,7 +160,7 @@ function view_shhs_ecg_v3()
         ui.textOther = uicontrol(panel,'Style','text','String','Other: -','HorizontalAlignment','left', ...
             'Units','pixels','Position',[520 y3 160 22],'BackgroundColor','w');
 
-        % Row 4: navigation and filtering
+        % Row 4: navigation & filter
         y4 = ctrlH - 170;
         ui.btnPrev = uicontrol(panel,'Style','pushbutton','String','←','Units','pixels', ...
             'Position',[10 y4 60 36],'Callback',@(~,~) stepSelection(-1),'BackgroundColor','w','FontSize',12,'FontWeight','bold');
@@ -121,17 +177,17 @@ function view_shhs_ecg_v3()
         y5 = ctrlH - 210;
         ui.btnSCA = uicontrol(panel,'Style','pushbutton','String','Predict SCA Risk','Units','pixels', ...
             'Position',[10 y5 120 28],'Callback',@onPredictSCA,'BackgroundColor','w');
-        ui.textSCA = uicontrol(panel,'Style','text','String','SCA risk: -','HorizontalAlignment','left', ...
+        ui.textSCA = uicontrol(panel,'Style','text','String','SCA Risk: -','HorizontalAlignment','left', ...
             'Units','pixels','Position',[140 y5 960 22],'BackgroundColor','w');
 
-        % Pre-created plot layer handles
-        ui.hECG = plot(ui.ax, NaN, NaN, 'b-','LineWidth',1); % ECG main line
+        % Pre-create graphics handles
+        ui.hECG = plot(ui.ax, NaN, NaN, 'b-','LineWidth',1); % ECG trace
         ui.hR_PVC = plot(ui.ax, NaN, NaN, 'rv','MarkerFaceColor','r','MarkerSize',6,'LineStyle','none'); % PVC R
         ui.hR_Other = plot(ui.ax, NaN, NaN, 'k^','MarkerFaceColor',[0.6 0.6 0.6],'MarkerSize',5,'LineStyle','none'); % Other R
         ui.hSel = plot(ui.ax, NaN, NaN, 'go','MarkerSize',10,'LineWidth',2,'LineStyle','none'); % selected highlight
         ui.textGroup = gobjects(0); % text labels
 
-        % Enable built-in zoom/pan and refresh accordingly
+        % Enable built-in zoom/pan and refresh
         ui.zoomObj = zoom(ui.fig); ui.zoomObj.Motion = 'both'; ui.zoomObj.Enable = 'on';
         ui.panObj = pan(ui.fig); ui.panObj.Enable = 'on';
         ui.zoomObj.ActionPostCallback = @onZoomPan;
@@ -139,7 +195,7 @@ function view_shhs_ecg_v3()
         set(ui.fig,'WindowScrollWheelFcn', @onScrollZoom);
     end
 
-    % Mouse wheel zoom (around cursor position)
+    % Mouse wheel zoom (scale x-axis around cursor position)
     function onScrollZoom(~,evd)
         if isempty(state.ecg), return; end
         try
@@ -179,7 +235,7 @@ function view_shhs_ecg_v3()
 
     % Initialize or update UI state
     function updateUIState(~)
-        % Button availability
+        % Basic control availability
         if isempty(state.ecg)
             set(ui.btnFindPVC,'Enable','off');
             set(ui.btnSCA,'Enable','off');
@@ -206,7 +262,7 @@ function view_shhs_ecg_v3()
         if isempty(state.edfPath)
             set(ui.textFile,'String','File: -');
             set(ui.textSize,'String','Size: -');
-            set(ui.textFs,'String','fs: -');
+            set(ui.textFs,'String','Sampling rate: -');
             set(ui.textDur,'String','Duration: -');
         else
             [~,nm,ext] = fileparts(state.edfPath);
@@ -216,12 +272,12 @@ function view_shhs_ecg_v3()
             else
                 set(ui.textSize,'String','Size: -');
             end
-            set(ui.textFs,'String',sprintf('fs: %d Hz', state.fs));
+            set(ui.textFs,'String',sprintf('Sampling rate: %d Hz', state.fs));
             durSec = state.N / max(state.fs,1);
             set(ui.textDur,'String',sprintf('Duration: %.1f s', durSec));
         end
 
-        % Stats
+        % Statistics
         if isempty(state.rGlobalAll)
             set(ui.textBeats,'String','Beats: -');
             set(ui.textPVC,'String','PVC: -');
@@ -234,7 +290,7 @@ function view_shhs_ecg_v3()
             set(ui.textBeats,'String',sprintf('Beats: %d', numBeats));
             set(ui.textPVC,'String',sprintf('PVC: %d', numPVC));
             set(ui.textOther,'String',sprintf('Other: %d', numOther));
-            % Selected info
+            % selection info
             sel = state.selectedBeatGlobalIdx;
             if ~isempty(sel) && sel>=1 && sel<=numBeats
                 set(ui.textSel,'String',sprintf('Selected: %d/%d', findCurrentFilteredPos(), numel(state.filteredBeatIndices)));
@@ -245,12 +301,12 @@ function view_shhs_ecg_v3()
 
         % SCA result
         if isempty(state.scaResultText)
-            set(ui.textSCA,'String','SCA risk: -');
+            set(ui.textSCA,'String','SCA Risk: -');
         else
             set(ui.textSCA,'String',state.scaResultText);
         end
 
-        % Plot refresh
+        % Re-render
         renderECGWindow(true);
     end
 
@@ -259,7 +315,7 @@ function view_shhs_ecg_v3()
         try
             startDir = fullfile(pwd,'shhs','polysomnography','edfs');
             if ~isfolder(startDir), startDir = pwd; end
-            [fn,fp] = uigetfile({'*.edf','EDF Files (*.edf)'}, 'Select EDF file', startDir);
+            [fn,fp] = uigetfile({'*.edf','EDF File (*.edf)'}, 'Select EDF file', startDir);
             if isequal(fn,0), return; end
             edfPath = fullfile(fp, fn);
             state.edfPath = edfPath;
@@ -302,24 +358,24 @@ function view_shhs_ecg_v3()
             elseif isnumeric(ecgCol)
                 ecg = ecgCol(:);
             else
-                errordlg(['ECG channel type not supported: ' class(ecgCol)], 'Channel Error');
+                errordlg(['Unsupported ECG channel type: ' class(ecgCol)], 'Channel Error');
                 return;
             end
             state.ecg = double(ecg);
             state.N = numel(state.ecg);
             state.time = (0:state.N-1)'/state.fs;
 
-            % Dual filtering: display (2), detection (3); SHHS1 already notched at 60 Hz
+            % Dual filtering: visualization (2), detection (2 here); SHHS1 has 60Hz notch
             try
                 [state.ecgVisFiltered, ~] = ecgFilter(state.ecg, state.fs, 2, 0);
             catch ME
-                warndlg(['Display filtering failed (using raw signal): ' ME.message], 'Filtering Warning');
+                warndlg(['Visualization filtering failed (using raw): ' ME.message], 'Filter Warning');
                 state.ecgVisFiltered = state.ecg;
             end
             try
                 [state.ecgDetFiltered, ~] = ecgFilter(state.ecg, state.fs, 2, 0);
             catch ME
-                warndlg(['Detection filtering failed (fallback to display signal): ' ME.message], 'Filtering Warning');
+                warndlg(['Detection filtering failed (fallback to visualization signal): ' ME.message], 'Filter Warning');
                 state.ecgDetFiltered = state.ecgVisFiltered;
             end
 
@@ -368,7 +424,7 @@ function view_shhs_ecg_v3()
         setViewStart(t);
     end
 
-    % Set window start and refresh
+    % Set window start (sec) and refresh
     function setViewStart(t0)
         if isempty(state.ecg)
             state.viewStartSec = 0;
@@ -381,7 +437,7 @@ function view_shhs_ecg_v3()
         renderECGWindow(false);
     end
 
-    % Find PVC
+    % Find PVCs
     function onFindPVC(~,~)
         if isempty(state.ecgDetFiltered)
             errordlg('Please import an EDF first.','Notice');
@@ -393,11 +449,11 @@ function view_shhs_ecg_v3()
             ANNOTD = {};
             [~, beatInfo, stats] = detectAndClassifyHeartbeats(state.ecgDetFiltered, ATRTIMED, ANNOTD, state.fs);
             if isfield(stats,'mteo_failed') && stats.mteo_failed
-                errordlg('MTEO(Q/S) detection failed.','Detection Failed');
+                errordlg('MTEO (Q/S) detection failed.','Detection Failed');
                 return;
             end
             if isempty(beatInfo)
-                errordlg('No valid beats obtained.','Detection Failed');
+                errordlg('No valid beats found.','Detection Failed');
                 return;
             end
             state.beatInfo = beatInfo;
@@ -406,14 +462,14 @@ function view_shhs_ecg_v3()
             % Feature extraction
             [featureTable, ~] = extractHeartbeatFeatures(beatInfo, state.fs);
             if isempty(featureTable) || height(featureTable) == 0
-                errordlg('Feature extraction is empty.','Error');
+                errordlg('Feature extraction returned empty.','Error');
                 return;
             end
 
             % Load model
             modelFile = fullfile(pwd,'results','trainedClassifier_latest.mat');
             if ~exist(modelFile,'file')
-                errordlg(['Model not found: ' modelFile],'Model Missing');
+                errordlg(['Model not found: ' modelFile],'Missing Model');
                 return;
             end
             M = load(modelFile);
@@ -424,7 +480,7 @@ function view_shhs_ecg_v3()
             end
             state.clsModel = trainedClassifier;
 
-            % Select required variables and impute missing
+            % Select variables and impute
             if isfield(trainedClassifier,'RequiredVariables') && ~isempty(trainedClassifier.RequiredVariables)
                 reqVars = trainedClassifier.RequiredVariables;
             else
@@ -432,7 +488,7 @@ function view_shhs_ecg_v3()
             end
             miss = setdiff(reqVars, featureTable.Properties.VariableNames);
             if ~isempty(miss)
-                errordlg(['Features missing required variables: ' strjoin(miss, ', ')],'Missing Variables');
+                errordlg(['Feature table missing model required variables: ' strjoin(miss, ', ')],'Missing Variables');
                 return;
             end
             X = featureTable(:, reqVars);
@@ -449,7 +505,7 @@ function view_shhs_ecg_v3()
                 end
             end
 
-            % Prediction
+            % Predict
             try
                 [predLabels, ~] = trainedClassifier.predictFcn(X);
             catch
@@ -469,7 +525,7 @@ function view_shhs_ecg_v3()
             state.pvcMask = strcmp(predLabels,'PVC');
             state.otherMask = strcmp(predLabels,'Other');
 
-            % Filter and select
+            % Filtering and selection
             rebuildFilteredIndices();
             if ~isempty(state.filteredBeatIndices)
                 state.selectedBeatGlobalIdx = state.filteredBeatIndices(1);
@@ -478,21 +534,21 @@ function view_shhs_ecg_v3()
 
             updateUIState('predicted_pvc');
         catch ME
-            errordlg(['PVC detection pipeline failed: ' ME.message], 'Error');
+            errordlg(['Find PVCs failed: ' ME.message], 'Error');
         end
     end
 
     % Predict SCA risk (record-level aggregated features)
     function onPredictSCA(~,~)
         if isempty(state.rGlobalAll) || ~any(state.pvcMask)
-            warndlg('No PVC beats available to predict SCA risk.','Notice');
+            warndlg('No PVC beats available; cannot predict SCA risk.','Notice');
             return;
         end
         try
             % Load SCA model
             modelFile = fullfile(pwd,'results','sca_classifier_post_ectopic.mat');
             if ~exist(modelFile,'file')
-                errordlg(['SCA model not found: ' modelFile],'Model Missing');
+                errordlg(['SCA model not found: ' modelFile],'Missing Model');
                 return;
             end
             M = load(modelFile);
@@ -500,18 +556,18 @@ function view_shhs_ecg_v3()
             predictorNames = M.predictorNames;
             state.scaModel = scaModel;
 
-            % Compute record-level aggregated features (consistent with training)
+            % Compute record-level aggregated features (aligned with training)
             pvcRidx = state.rGlobalAll(state.pvcMask);
-            Trec = computePostPVCFeatureTable(pvcRidx, 5.0); % Now single row aggregated table
+            Trec = computePostPVCFeatureTable(pvcRidx, 5.0); % single-row aggregation table
             if isempty(Trec) || height(Trec)~=1
-                errordlg('Record-level aggregated features not obtained.','Error');
+                errordlg('Did not obtain record-level aggregated features.','Error');
                 return;
             end
 
-            % Select predictors and impute
+            % Select model predictors and impute
             miss = setdiff(predictorNames, Trec.Properties.VariableNames);
             if ~isempty(miss)
-                errordlg(['Missing SCA model required variables: ' strjoin(miss, ', ')],'Missing Variables');
+                errordlg(['Missing required variables for SCA model: ' strjoin(miss, ', ')],'Missing Variables');
                 return;
             end
             Xin = Trec(:, predictorNames);
@@ -527,7 +583,7 @@ function view_shhs_ecg_v3()
                 end
             end
 
-            % Predict death risk score (scores = P(y==0))
+            % Predict death risk probability (scores for class 0)
             try
                 [~, rawScores] = predict(scaModel.ClassificationEnsemble, Xin);
             catch
@@ -554,7 +610,7 @@ function view_shhs_ecg_v3()
 
             hasRisk = (scoreDead >= thr);
 
-            % Query patient survival info
+            % Lookup patient's actual vital
             [vitalVal, vitalFound] = getVitalForCurrentRecord();
             state.patientVital = vitalVal;
             vitalStr = 'Unknown';
@@ -570,10 +626,10 @@ function view_shhs_ecg_v3()
 
             % pvcCount = Trec.record_pvc_count;
             % pvcPerHour = Trec.PVCs_per_hour;
-            % state.scaResultText = sprintf('SCA risk: %s | PVCs=%d, PVC density=%.2f /h | Death risk=%.3f, Thr=%.2f | Actual=%s', ...
-            %     ternary(hasRisk,'At risk','No risk'), pvcCount, pvcPerHour, scoreDead, thr, vitalStr);
-            state.scaResultText = sprintf('SCA risk: %s | Actual=%s', ...
-            ternary(hasRisk,'At risk','No risk'), vitalStr);
+            % state.scaResultText = sprintf('SCA Risk: %s | PVC count=%d, PVC density=%.2f /h | Death risk=%.3f, Thr=%.2f | Actual vital=%s', ...
+            %     ternary(hasRisk,'At Risk','No Risk'), pvcCount, pvcPerHour, scoreDead, thr, vitalStr);
+            state.scaResultText = sprintf('SCA Risk: %s | Actual vital=%s', ...
+            ternary(hasRisk,'At Risk','No Risk'), vitalStr);
 
             updateUIState('sca_predicted');
         catch ME
@@ -581,7 +637,7 @@ function view_shhs_ecg_v3()
         end
     end
 
-    % View rendering
+    % Render current window
     function renderECGWindow(preserveXLim)
         if nargin<1, preserveXLim=false; end
         if isempty(state.ecg)
@@ -623,7 +679,7 @@ function view_shhs_ecg_v3()
             lblView = state.predLabels(inView);
             isPVC = strcmp(lblView,'PVC');
             isOther = strcmp(lblView,'Other');
-            % Use detection-filtered indices for position, amplitude from display-filtered signal
+            % Positions from detection indices, amplitude from visualization series
             set(ui.hR_PVC,'XData',tR(isPVC),'YData',interpY(iStart, y, rIdxView(isPVC)));
             set(ui.hR_Other,'XData',tR(isOther),'YData',interpY(iStart, y, rIdxView(isOther)));
             % Text labels
@@ -635,7 +691,7 @@ function view_shhs_ecg_v3()
                 if strcmp(lblView{k},'PVC'), col = [0.85 0.1 0.1]; end
                 ui.textGroup(k) = text(ui.ax, tx, ty, lblView{k}, 'Color', col, 'FontSize',8, 'HorizontalAlignment','center');
             end
-            % Selected highlight
+            % Selection highlight
             sel = state.selectedBeatGlobalIdx;
             if ~isempty(sel) && sel>=1 && sel<=numel(state.rGlobalAll)
                 selIdx = state.rGlobalAll(sel);
@@ -679,9 +735,9 @@ function view_shhs_ecg_v3()
         ui.textGroup = gobjects(0);
     end
 
-    % Interpolate selected point's y (bounds-safe)
+    % Interpolate y at index (clamped to bounds)
     function yv = interpY(iStart, yseg, globalIdx)
-        % globalIdx is index in full signal; convert to segment index
+        % globalIdx is into the original signal; convert to segment index
         ii = max(1, min(numel(yseg), globalIdx - iStart + 1));
         yv = yseg(ii);
     end
@@ -706,20 +762,20 @@ function view_shhs_ecg_v3()
         end
     end
 
-    % Current selection position within filtered sequence
+    % Position of current selection among filtered indices
     function pos = findCurrentFilteredPos()
         pos = NaN;
         if isempty(state.filteredBeatIndices), return; end
         pos = find(state.filteredBeatIndices == state.selectedBeatGlobalIdx, 1, 'first');
         if isempty(pos)
-            % If not in list, choose nearest
+            % if not found, find the nearest
             dif = abs(state.filteredBeatIndices - state.selectedBeatGlobalIdx);
             [~,mi] = min(dif);
             pos = mi;
         end
     end
 
-    % Step selection left/right
+    % Move selection left/right
     function stepSelection(step)
         if isempty(state.filteredBeatIndices), return; end
         curPos = findCurrentFilteredPos();
@@ -730,7 +786,7 @@ function view_shhs_ecg_v3()
         updateUIState('step_sel');
     end
 
-    % Filter change
+    % Filter changed
     function onFilterChanged(~,~)
         items = get(ui.popupFilter,'String');
         val = get(ui.popupFilter,'Value');
@@ -755,20 +811,32 @@ function view_shhs_ecg_v3()
         setViewStart(t0);
     end
 
-    % Compute record-level 5-second post-PVC feature aggregation (single row)
+    % Compute record-level aggregated features (aligned with training script: variable observation window, recovery, clusters/density, etc.)
     function T = computePostPVCFeatureTable(pvcIndices, postWindowSec)
         if isempty(pvcIndices)
             T = table(); return;
         end
         fs = state.fs; N = state.N;
         rGlobalAll = state.rGlobalAll(:);
-        % Map to beat indices (nearest neighbor)
+        beatInfo = state.beatInfo;
+
+        % Config (consistent with training script)
+        baselineSec = 40; baselineMinBeats = 10; maxObsSec = 20; consecBeats = 5;
+        rrTolFrac = 0.10; rrTolSigma = 2.0; tsLowThr = 0.0; hrTolBpm = 5;
+        joinSec = 10; winSec30 = 30; winSec60 = 60;
+
+        % Sort PVC global samples and map to beat indices
         pvcIndicesSorted = sort(pvcIndices(:));
         idxPVC_all_sorted = round(interp1(rGlobalAll, 1:numel(rGlobalAll), pvcIndicesSorted, 'nearest', 'extrap'));
         idxPVC_all_sorted = max(1, min(numel(rGlobalAll), idxPVC_all_sorted));
+        numPVC = numel(pvcIndicesSorted);
 
         % RR vectors
         numBeatsRec = numel(rGlobalAll);
+        rr_between = nan(numBeatsRec,1);
+        if numBeatsRec >= 2
+            rr_between(2:end) = (rGlobalAll(2:end) - rGlobalAll(1:end-1)) / fs;
+        end
         rr_pre_vec = nan(numBeatsRec,1); rr_post1_vec = nan(numBeatsRec,1); rr_post2_vec = nan(numBeatsRec,1);
         if numBeatsRec >= 2
             rr_pre_vec(2:end) = (rGlobalAll(2:end) - rGlobalAll(1:end-1)) / fs;
@@ -779,10 +847,9 @@ function view_shhs_ecg_v3()
         end
 
         % QRS duration and R amplitude
-        qrs_dur_vec = nan(numBeatsRec,1);
-        r_amp_vec = nan(numBeatsRec,1);
+        qrs_dur_vec = nan(numBeatsRec,1); r_amp_vec = nan(numBeatsRec,1);
         for ii = 1:numBeatsRec
-            b = state.beatInfo(ii);
+            b = beatInfo(ii);
             on = NaN; off = NaN;
             if isfield(b,'qrsOnIndex'), on = double(b.qrsOnIndex); end
             if isfield(b,'qrsOffIndex'), off = double(b.qrsOffIndex); end
@@ -794,31 +861,139 @@ function view_shhs_ecg_v3()
             end
         end
 
-        % Window bounds
-        winLen = round(postWindowSec * fs);
-        winStartVec = pvcIndicesSorted;
-        winEndVec = min(N, winStartVec + winLen);
-        winDurSecVec = (winEndVec - winStartVec) / fs;
-
-        % Count beats within 5 s window (two pointers)
-        counts = zeros(numel(pvcIndicesSorted),1);
-        left = 1; right = 0; numPVC = numel(pvcIndicesSorted);
-        for kk = 1:numPVC
-            a = winStartVec(kk); b = winEndVec(kk);
-            while right < numBeatsRec && rGlobalAll(right+1) <= b
-                right = right + 1;
+        % PVC flags and SQI
+        isPVCBeat = false(numBeatsRec,1);
+        if ~isempty(idxPVC_all_sorted)
+            isPVCBeat(unique(idxPVC_all_sorted)) = true;
+        end
+        if isfield(beatInfo, 'sqiIsGood')
+            try
+                sqiVec = arrayfun(@(b) (isfield(b,'sqiIsGood') && ~isempty(b.sqiIsGood) && logical(b.sqiIsGood)), beatInfo);
+                sqiVec = logical(sqiVec(:));
+            catch
+                sqiVec = true(numBeatsRec,1);
             end
-            while left <= numBeatsRec && rGlobalAll(left) < a
-                left = left + 1;
-            end
-            if right >= left
-                counts(kk) = right - left + 1;
-            else
-                counts(kk) = 0;
-            end
+        else
+            sqiVec = true(numBeatsRec,1);
         end
 
-        % Window-level features
+        % Per-PVC measures: recovery, AUC, HRT, TS abnormality
+        nextPVCsamples = [pvcIndicesSorted(2:end); inf];
+        recovered_flags = false(numPVC,1);
+        recovery_time_sec = nan(numPVC,1);
+        auc_rr_dev = nan(numPVC,1);
+        hrt_to_vals = nan(numPVC,1);
+        hrt_ts_abnormal = nan(numPVC,1);
+
+        for kk = 1:numPVC
+            pvcSample = pvcIndicesSorted(kk);
+            idxPVC = idxPVC_all_sorted(kk);
+            nextPVC = nextPVCsamples(kk);
+            obsEnd = min([double(N), double(pvcSample) + round(maxObsSec*fs), double(nextPVC)-1]);
+            if ~isfinite(obsEnd) || obsEnd <= pvcSample
+                continue;
+            end
+
+            % Personalized baseline RR
+            baseA = max(1, double(pvcSample) - round(baselineSec*fs));
+            baseB = max(1, double(pvcSample) - 1);
+            j_in_baseline = find(rGlobalAll >= baseA & rGlobalAll <= baseB);
+            j_in_baseline = j_in_baseline(:);
+            j_in_baseline = j_in_baseline(j_in_baseline >= 2);
+            if ~isempty(j_in_baseline)
+                mask_ok = ~isPVCBeat(j_in_baseline) & ~isPVCBeat(j_in_baseline-1) & sqiVec(j_in_baseline) & sqiVec(j_in_baseline-1);
+                j_in_baseline = j_in_baseline(mask_ok);
+            end
+            rr_base_vec = rr_between(j_in_baseline);
+            rr_base_vec = rr_base_vec(isfinite(rr_base_vec));
+            if numel(rr_base_vec) < max(3, baselineMinBeats)
+                j_all = (2:numBeatsRec).';
+                mask_all = ~isPVCBeat(j_all) & ~isPVCBeat(j_all-1) & sqiVec(j_all) & sqiVec(j_all-1);
+                rr_all = rr_between(j_all(mask_all));
+                rr_all = rr_all(isfinite(rr_all));
+                if isempty(rr_all)
+                    muRR = median(rr_between(isfinite(rr_between)));
+                    sigRR = std(rr_between(isfinite(rr_between)));
+                else
+                    muRR = mean(rr_all);
+                    sigRR = std(rr_all);
+                end
+            else
+                muRR = mean(rr_base_vec);
+                sigRR = std(rr_base_vec);
+            end
+            if ~isfinite(muRR) || muRR<=0
+                muRR = median(rr_between(isfinite(rr_between)));
+            end
+            if ~isfinite(sigRR)
+                sigRR = 0.0;
+            end
+
+            % HRT (TO/TS) and abnormality
+            rr_pre = NaN; rr_post1 = NaN; rr_post2 = NaN;
+            if idxPVC >= 2 && isfinite(rr_between(idxPVC)), rr_pre = rr_between(idxPVC); end
+            if idxPVC+1 <= numBeatsRec && isfinite(rr_between(idxPVC+1)), rr_post1 = rr_between(idxPVC+1); end
+            if idxPVC+2 <= numBeatsRec && isfinite(rr_between(idxPVC+2)), rr_post2 = rr_between(idxPVC+2); end
+            if isfinite(rr_pre) && isfinite(rr_post1)
+                hrt_to_vals(kk) = (rr_post1 - rr_pre) / max(rr_pre, eps);
+            else
+                hrt_to_vals(kk) = NaN;
+            end
+            % TS: maximum average slope of any 5 consecutive non-PVC good-SQI RR within 5-15 beats after PVC
+            j_after = (idxPVC+1):min(numBeatsRec, idxPVC+20); j_after = j_after(:);
+            mask_rr_ok = true(size(j_after));
+            mask_rr_ok = mask_rr_ok & (rGlobalAll(j_after) <= obsEnd) & (rGlobalAll(j_after-1) >= pvcSample);
+            mask_rr_ok = mask_rr_ok & ~isPVCBeat(j_after) & ~isPVCBeat(j_after-1) & sqiVec(j_after) & sqiVec(j_after-1);
+            j_after = j_after(mask_rr_ok);
+            ts_val = NaN;
+            if numel(j_after) >= 7
+                rr_seq = rr_between(j_after);
+                maxSlope = -inf;
+                for uu = 1:(numel(rr_seq)-4)
+                    slope = (rr_seq(uu+4) - rr_seq(uu)) / 4.0;
+                    if slope > maxSlope, maxSlope = slope; end
+                end
+                ts_val = maxSlope;
+            end
+            if isfinite(ts_val)
+                hrt_ts_abnormal(kk) = double(ts_val <= tsLowThr);
+            else
+                hrt_ts_abnormal(kk) = NaN;
+            end
+
+            % Recovery (RR-based) and AUC(|RR-μRR|)
+            j = idxPVC + 1; consec = 0; recFlag = false; recJ = NaN; aucVal = 0.0; lastSample = pvcSample;
+            while j <= numBeatsRec
+                if rGlobalAll(j) > obsEnd, break; end
+                if j >= 2 && ~isPVCBeat(j) && ~isPVCBeat(j-1) && sqiVec(j) && sqiVec(j-1) && isfinite(rr_between(j))
+                    rrj = rr_between(j);
+                    tolAbs = max(rrTolFrac * muRR, rrTolSigma * sigRR);
+                    if abs(rrj - muRR) <= tolAbs
+                        consec = consec + 1;
+                        if consec >= consecBeats
+                            recFlag = true; recJ = j; 
+                            % 仍然累计AUC到此点
+                        end
+                    else
+                        consec = 0;
+                    end
+                    dt = (rGlobalAll(j) - lastSample) / baselineSec; % time normalization
+                    aucVal = aucVal + abs(rrj - muRR) * max(dt, eps);
+                    lastSample = rGlobalAll(j);
+                    if recFlag, break; end
+                end
+                j = j + 1;
+            end
+            recovered_flags(kk) = recFlag;
+            if recFlag && isfinite(recJ)
+                recovery_time_sec(kk) = (double(rGlobalAll(recJ)) - double(pvcSample)) / fs;
+            else
+                recovery_time_sec(kk) = (double(obsEnd) - double(pvcSample)) / fs;
+            end
+            auc_rr_dev(kk) = aucVal;
+        end
+
+        % Assemble window-level feature vectors (consistent with training)
         RR_Pre = rr_pre_vec(idxPVC_all_sorted);
         RR_Post1 = rr_post1_vec(idxPVC_all_sorted);
         RR_Post2 = rr_post2_vec(idxPVC_all_sorted);
@@ -826,21 +1001,47 @@ function view_shhs_ecg_v3()
         HRT_TS = (RR_Post2 - RR_Pre) / 2;
         QRS_Dur_PVC = qrs_dur_vec(idxPVC_all_sorted);
         R_Amp_PVC = r_amp_vec(idxPVC_all_sorted);
-        Beats_in_5s = counts;
-        HR_Pre = 60 ./ RR_Pre;
-        HR_Post1 = 60 ./ RR_Post1;
-        HR_5s = (counts ./ max(winDurSecVec, eps)) * 60;
+        % Keep legacy names for compatibility; placeholders retained
+        Beats_in_5s = nan(numPVC,1); HR_5s = nan(numPVC,1);
+        HR_Pre = 60 ./ RR_Pre; HR_Post1 = 60 ./ RR_Post1;
 
         % Derived vectors
         HR_Accel = HR_Post1 - HR_Pre;
         CompRatio = RR_Post1 ./ (RR_Pre + eps);
         pvcIntervals = diff(pvcIndicesSorted) / fs;
 
-        % Record-level stats
+        % Clusters and density
+        pvcTimes = pvcIndicesSorted / fs;
+        clusterStarts = []; clusterEnds = []; clusterSizes = [];
+        if numPVC >= 1
+            curStart = pvcTimes(1); curEnd = pvcTimes(1); curSize = 1;
+            for kk = 2:numPVC
+                if (pvcTimes(kk) - curEnd) < joinSec
+                    curEnd = pvcTimes(kk); curSize = curSize + 1;
+                else
+                    clusterStarts(end+1) = curStart; %#ok<AGROW>
+                    clusterEnds(end+1) = curEnd; %#ok<AGROW>
+                    clusterSizes(end+1) = curSize; %#ok<AGROW>
+                    curStart = pvcTimes(kk); curEnd = pvcTimes(kk); curSize = 1;
+                end
+            end
+            clusterStarts(end+1) = curStart; clusterEnds(end+1) = curEnd; clusterSizes(end+1) = curSize;
+        end
+        clusterDurations = max(0, clusterEnds - clusterStarts);
+        pvcDensity30_max_per_min = max_density(pvcTimes, winSec30);
+        pvcDensity60_max_per_min = max_density(pvcTimes, winSec60);
+        longest_noPVC_sec = NaN;
+        if numPVC >= 2
+            longest_noPVC_sec = max(diff(pvcTimes));
+        elseif numPVC == 1
+            longest_noPVC_sec = max(pvcTimes(1), (N/fs) - pvcTimes(1));
+        end
+
+        % Record-level rates
         recordDurationHr = (N / fs) / 3600;
         pvcPerHour = numPVC / max(recordDurationHr, eps);
 
-        % Assemble aggregation struct
+        % Build aggregated structure (field names aligned with training)
         S = struct();
         S.record_pvc_count = numPVC;
         S.PVCs_per_hour = pvcPerHour;
@@ -856,32 +1057,89 @@ function view_shhs_ecg_v3()
         S = agg_add_stats(S, HR_Pre,    'HR_Pre');
         S = agg_add_stats(S, HR_Post1,  'HR_Post1');
         S = agg_add_stats(S, HR_5s,     'HR_5s');
-        S = agg_add_stats(S, HR_Accel,  'HR_Accel');
-        S = agg_add_stats(S, CompRatio, 'CompRatio');
-        S = agg_add_stats(S, pvcIntervals, 'PVC_Interval');
 
-        % Proportions and HRV-derived metrics
+        % Additional aggregates
         mask_to = isfinite(HRT_TO);
-        if any(mask_to)
-            S.HRT_TO_neg_frac = mean(double(HRT_TO(mask_to) < 0));
-        else
-            S.HRT_TO_neg_frac = NaN;
-        end
+        if any(mask_to), S.HRT_TO_neg_frac = mean(double(HRT_TO(mask_to) < 0)); else, S.HRT_TO_neg_frac = NaN; end
         mask_qrs = isfinite(QRS_Dur_PVC);
-        if any(mask_qrs)
-            S.QRS_Prolonged_frac = mean(double(QRS_Dur_PVC(mask_qrs) > 0.12));
-        else
-            S.QRS_Prolonged_frac = NaN;
-        end
+        if any(mask_qrs), S.QRS_Prolonged_frac = mean(double(QRS_Dur_PVC(mask_qrs) > 0.12)); else, S.QRS_Prolonged_frac = NaN; end
+        S = agg_add_stats(S, HR_Accel,   'HR_Accel');
+        S = agg_add_stats(S, CompRatio,  'CompRatio');
         S.RR_Pre_CV   = agg_cv(RR_Pre);
         S.RR_Post1_CV = agg_cv(RR_Post1);
         S.RR_Pre_RMSSD   = agg_rmssd(RR_Pre);
         S.RR_Post1_RMSSD = agg_rmssd(RR_Post1);
+        S = agg_add_stats(S, recovery_time_sec, 'recovery_time_sec');
+        S = agg_add_stats(S, auc_rr_dev, 'AUC_RR_Deviation');
+        S = agg_add_stats(S, pvcIntervals, 'PVC_Interval');
+
+        % Clusters & high density
+        S.cluster_count = numel(clusterSizes);
+        S = agg_add_stats(S, clusterDurations, 'cluster_duration_sec');
+        S = agg_add_stats(S, clusterSizes,     'cluster_size');
+        S.PVC_density30_max_per_min = pvcDensity30_max_per_min;
+        S.PVC_density60_max_per_min = pvcDensity60_max_per_min;
+        S.longest_noPVC_sec = longest_noPVC_sec;
+
+        % Recovery ratios
+        S.recovered_frac = mean(double(recovered_flags));
+        S.recovery_failure_ratio = mean(double(~recovered_flags));
+
+        % HRT abnormal fractions
+        if any(isfinite(hrt_to_vals))
+            S.HRT_TO_abnormal_frac = mean(double(hrt_to_vals(isfinite(hrt_to_vals)) >= 0));
+        else
+            S.HRT_TO_abnormal_frac = NaN;
+        end
+        if any(isfinite(hrt_ts_abnormal))
+            S.HRT_TS_abnormal_frac = mean(double(hrt_ts_abnormal(isfinite(hrt_ts_abnormal)) > 0));
+        else
+            S.HRT_TS_abnormal_frac = NaN;
+        end
+
+        % Recovery failure fraction inside clusters
+        if ~isempty(clusterSizes)
+            rec_fail_in_clusters = [];
+            pvcTimesVec = pvcTimes; %#ok<NASGU>
+            for c = 1:numel(clusterSizes)
+                inC = pvcTimes >= clusterStarts(c) & pvcTimes <= clusterEnds(c);
+                if any(inC)
+                    rec_fail_in_clusters(end+1) = mean(double(~recovered_flags(inC))); %#ok<AGROW>
+                end
+            end
+            if ~isempty(rec_fail_in_clusters)
+                S.recovery_failure_in_clusters_frac_mean = mean(rec_fail_in_clusters);
+                S.recovery_failure_in_clusters_frac_max  = max(rec_fail_in_clusters);
+            else
+                S.recovery_failure_in_clusters_frac_mean = NaN;
+                S.recovery_failure_in_clusters_frac_max  = NaN;
+            end
+        else
+            S.recovery_failure_in_clusters_frac_mean = NaN;
+            S.recovery_failure_in_clusters_frac_max  = NaN;
+        end
 
         T = struct2table(S);
+
+        % Local density function
+        function mx = max_density(ts, winSec)
+            if isempty(ts)
+                mx = 0; return;
+            end
+            i = 1; j = 0; mx = 0; nloc = numel(ts);
+            for i = 1:nloc
+                while j < nloc && (ts(j+1) - ts(i)) <= winSec
+                    j = j + 1;
+                end
+                if (j - i + 1) > mx
+                    mx = j - i + 1;
+                end
+            end
+            mx = mx / (winSec/60);
+        end
     end
 
-    % Read patient's actual survival information (vital: 0=Dead,1=Alive)
+    % Read patient's actual vital (vital: 0=Dead,1=Alive)
     function [vitalVal, found] = getVitalForCurrentRecord()
         vitalVal = NaN; found = false;
         if isempty(state.edfPath), return; end
@@ -899,7 +1157,7 @@ function view_shhs_ecg_v3()
         if ~exist(cand,'file')
             d1 = dir(fullfile(pwd,'shhs','datasets','**','shhs-cvd-summary-dataset-*.csv'));
             if ~isempty(d1)
-                % Take the latest modification time
+                % pick the most recently modified
                 [~,mi] = max([d1.datenum]); %#ok<DATNM>
                 cand = fullfile(d1(mi).folder, d1(mi).name);
             else
@@ -924,10 +1182,10 @@ function view_shhs_ecg_v3()
         end
         vitalCol = T{:,iVital};
         vtmp = string(vitalCol);
-        % Match
+        % match
         idx = find(ids == idNum, 1, 'first');
         if isempty(idx), return; end
-        % Parse vital
+        % parse vital
         valStr = lower(strtrim(vtmp(idx)));
         if any(strcmp(valStr, {'1','alive'}))
             vitalVal = 1; found = true; return;
@@ -1000,5 +1258,3 @@ function view_shhs_ecg_v3()
         rmssd = sqrt(mean(d.^2));
     end
 end
-
-
