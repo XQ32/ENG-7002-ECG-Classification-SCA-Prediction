@@ -130,18 +130,92 @@ Label:
 ```
 
 ### 4.2 Record-Level (Post-PVC Recovery) Features (`generate_sca_classifier_v3.m`)
-For each PVC, the script builds recovery series primitives (RR/T/QTc), applies statistical aggregation (mean/std/median/min/max), and derives ratio/proportion/instability metrics, then trains a binary model (Alive=1 / Dead=0).
 
-Typical primitives/derived examples:
-```
-RR_Pre/RR_Post1/RR_Post2, HRT_TO/HRT_TS, QRS_Dur_PVC, R_Amp_PVC, Beats_in_5s,
-HR series (HR_Pre/HR_Post1/HR_5s/HR_Accel), CompRatio, PVC_Interval,
-RR recovery half-lives/time constant/overshoot/oscillation/stalls, late instability variance,
-T-amplitude and QTc recovery, etc.
-```
+This v3 script consumes only `{record}_info.mat` files and constructs post-PVC recovery dynamics features without accessing raw ECG. It operates per record as follows:
 
-Aggregations include `<Name>_mean/_std/_median/_min/_max`; proportions/variability include
-`PVCs_per_hour, HRT_TO_neg_frac, QRS_Prolonged_frac, RR_*_CV/RMSSD, CompRatio_*, record_pvc_count`, etc.
+1) For each predicted PVC, build post-PVC series for RR, T-amplitude, and approximate QTc under quality gates.
+2) Compute per-PVC recovery primitives (half-life, time constant, oscillation, etc.).
+3) Aggregate per-PVC metrics to record-level features and add demographics if present.
+4) Train an imbalance-aware binary classifier (Alive=1 / Dead=0).
+
+Below is the complete list of record-level features exported to `results/post_ectopic_features_v3.mat` and used downstream. Names match the MATLAB struct/table fields.
+
+#### 4.2.1 Baseline and Series Definitions
+
+- Baseline window: `[pvcSample - baselineSec, pvcSample)` in seconds; default `baselineSec=50` s.
+- Baseline RR set `baseRR_vec`: non-PVC beats with good SQI on both ends, valid RR range `[minRR, maxRR]` (default `[0.30, 2.50]` s). `muRR = mean(baseRR_vec)`, `sigRR = std(baseRR_vec)`; fallback to robust stats if too few beats (`baselineMinBeats=10`).
+- Post-PVC RR series: indices after the PVC with conditions: non-PVC, good SQI on both ends, valid RR range, and within observation window up to `maxObsSec=50` s (or earlier next PVC).
+- Deviation for RR: `dev_rr(t) = |RR(t) - muRR| / muRR`.
+- T-amplitude baseline `muTamp`: mean absolute T amplitude within baseline if available.
+- T deviation: `dev_tamp(t) = |Tamp(t) - muTamp| / muTamp` (when `muTamp > 0`).
+- Approximate QTc per beat: with T-peak index `tGlobalIdx(j) > rGlobalAll(j)` and `RR(j) > 0`, approximate `QT ≈ (tGlobalIdx - rIndex)/fs + 0.5*QRS_dur(j)` and `QTc = QT / RR^(1/3)`; valid QT ∈ [0.20, 0.60] s and QTc ∈ [0.30, 0.70] s. Deviation `dev_qtc(t) = |QTc(t) - muQTc| / muQTc`, where `muQTc` is the baseline mean of valid QTc.
+- HRT metrics:
+	- `HRT_TO = (RR_Post1 - RR_Pre) / RR_Pre`.
+	- `HRT_TS` (approximate): among the 5–15th post-PVC eligible RR intervals, take the maximum slope over any 5-consecutive RR window, i.e., `max{ (RR(i+4) - RR(i))/4 }`.
+
+Key parameters (defaults in `generate_sca_classifier_v3.m`):
+- `consecStableBeats=10` (required consecutive beats to declare stability).
+- `hrt_ts_low_thr=0.0` (threshold to flag abnormally low TS).
+
+#### 4.2.2 Per-PVC Recovery Primitives
+
+- Half-life of RR deviation, 50%/30%/10%: first time `t` where `dev_rr ≤ {0.50, 0.30, 0.10}` holds for `consecStableBeats` consecutive points.
+- Time constant of RR deviation `tau_rr`: fit `y = log(max(dev_rr, eps))` vs `t` over the first K points (K=8) by linear regression; if slope `a < 0`, `tau = -1/a`, else `NaN`.
+- AUC of RR deviation `auc_rr`: trapezoidal ∫ dev_rr dt, with time normalized by `baselineSec` to reduce long-record bias (not included in final record features).
+- Oscillation index `oscill_rr`: fraction of sign changes in the first difference of `dev_rr` (number of sign flips divided by number of difference steps).
+- Recovery stalls `stalls_rr`: number of qualifying under-threshold segments (threshold 0.20 with length ≥ `consecStableBeats`) minus one; indicates re-instability after initial convergence (not aggregated in final features).
+- Late instability variance `late_var_rr`: variance of `dev_rr` for `t ≥ 5 s` (not aggregated in final features).
+- T-amplitude half-life and AUC analogous to RR (AUC not kept in final features).
+- QTc half-life and AUC of `dev_qtc` (AUC kept as mean at record-level; see below).
+- Coupling ratio `coupling_ratio = RR_Pre / muRR`.
+- Peak HR acceleration `hr_peak_accel_bpm = max( 60/RR_Post1 - 60/muRR, 60/RR_Post2 - 60/muRR )`.
+- Early/Late mean deviation of RR: early window `[0,5]` s, late window `(5,15]` s.
+- Piecewise linear slopes of RR deviation: slope over `[0,5]` s and `(5,15]` s via linear fit.
+- Sample entropy (RR deviation): `SampEn(m=2, r=0.2*std)` (not aggregated in final features).
+- LZ complexity (RR deviation sign of first difference) (not aggregated in final features).
+- Poincaré SD1/SD2 ratio: Post (≤10 s) vs Pre baseline ratio (not aggregated in final features).
+- 95th percentile of RR deviation (not aggregated in final features).
+- Spearman correlation between `dev_rr` and `dev_tamp` (kept as median at record-level).
+- QTc overshoot fraction and magnitude: fraction where `dev_qtc > 0.10` and magnitude above 0.10 (only fraction is kept at record-level).
+
+#### 4.2.3 Record-Level Feature Dictionary (exported columns)
+
+Below are the exact table columns with units and formulas/aggregation:
+
+- `record` (string): record base name, e.g., `shhs1-XXXXXX`.
+- `patientVital` (numeric): 1=Alive, 0=Dead (response variable).
+- `PVCs_per_hour` (1/hour): number of PVCs divided by record duration (hours).
+- `PVC_count` (count): total number of PVCs in the record.
+- `recovery_failure_ratio` (0–1): fraction of PVCs where recovery metrics could not be determined within the observation window (e.g., insufficient valid points or censored before reaching stability).
+- `halflife_rr_median` (s): median of 50% half-life of `dev_rr` across PVCs.
+- `halflife_rr30_median` (s): median of 30% half-life of `dev_rr` across PVCs.
+- `halflife_rr10_median` (s): median of 10% half-life of `dev_rr` across PVCs.
+- `tau_rr_median` (s): median time constant from the log-linear fit on the first K points (K=8) per PVC.
+- `oscill_rr_median` (0–1): median oscillation index of `dev_rr` across PVCs (sign-change rate of first differences).
+- `HRT_TO_abnormal_frac` (0–1): fraction of PVCs with `HRT_TO ≥ 0` (treated as abnormal in this pipeline).
+- `HRT_TS_low_frac` (0–1): fraction of PVCs with `HRT_TS ≤ hrt_ts_low_thr` (default threshold 0.0).
+- `halflife_tamp_median` (s): median 50% half-life of T-amplitude deviation `dev_tamp` across PVCs.
+- `halflife_qtc_median` (s): median 50% half-life of QTc deviation `dev_qtc` across PVCs.
+- `auc_qtc_mean` (unitless): mean AUC of `dev_qtc` (time normalized by `baselineSec`).
+- `RR_Pre_RMSSD_mean` (s): mean RMSSD computed from baseline RR per PVC; for each PVC baseline RR sequence, `RMSSD = sqrt(mean(diff(RR)^2))`, then averaged.
+- `coupling_ratio_mean` (unitless): mean `RR_Pre / muRR` across PVCs.
+- `hr_peak_accel_bpm_mean` (bpm): mean of peak HR acceleration (see definition above) across PVCs.
+- `rr_dev_late_minus_early` (unitless): median(late mean deviation) − median(early mean deviation) across PVCs.
+- `rr_dev_slope_0_5s_med` (unitless/s): median slope of `dev_rr` over `[0,5]` s across PVCs (linear fit).
+- `tamp_rr_corr_med` (−1..1): median Spearman correlation between `dev_rr` and `dev_tamp` (matched time points) across PVCs.
+- `qtc_overshoot_frac_mean` (0–1): mean fraction of time points where `dev_qtc > 0.10` across PVCs.
+- `recovery_rate_hmean` (1/s): mean of `1 / halflife_rr` across PVCs with finite positive half-life (harmonic-mean-like recovery rate).
+- `PVC_to_next_nonPVC_sec_mean` (s): mean time from PVC occurrence to the next non-PVC beat.
+- `PVC_to_next_nonPVC_sec_max` (s): max time from PVC to the next non-PVC beat.
+- `PVC_to_next_nonPVC_sec_min` (s): min time from PVC to the next non-PVC beat.
+- `nsrrid` (string): subject ID derived from record name (e.g., `shhs1-200002` → `200002`).
+- `censdate` (numeric): follow-up censor date (if available in covariate CSV; used for analysis, not as a predictor).
+- `age_s1` (years): age at visit S1, truncated at 90 in the source dataset (if present in covariate CSV).
+
+Notes:
+- Some per-PVC primitives are computed but not retained at record level (e.g., `auc_rr`, `stalls_rr`, `late_var_rr`, sample entropy, LZ complexity, Poincaré ratio). They were explored and may be re-enabled for ablation/experiments.
+- Default quality gates: `minPVCPerRecord=10`, `minSQIRatio=0.60` (ratio of usable non-PVC beats with good SQI); records failing gates are skipped.
+- Observation window ends at the earlier of: `pvcSample + maxObsSec*fs`, next PVC sample − 1, or end of record.
 
 Response variable: `patientVital` (1=Alive, 0=Dead).
 
@@ -179,6 +253,9 @@ results/                               # runtime outputs (created if missing)
 ```
 
 Note: SHHS1 data are typically already 60 Hz notched. Filtering defaults to `power_line_freq=0` to avoid double-notching.
+
+Optional files:
+- A blacklist CSV (e.g., `badsignallist.csv`) to exclude known low-quality or problematic records. If you use one, set its path at the top of the relevant script(s).
 
 ## 7. How to Run
 
@@ -260,3 +337,9 @@ view_shhs_ecg_v3    % integrated viewing/classification/navigation + quick SCA r
 
 —
 Questions or contributions are welcome. Feel free to add environment/path/parameter notes to the README and open an issue.
+
+## 12. Changelog
+
+- 2025-09-10
+	- Translated all comments and user-facing output strings in `generate_sca_classifier_v3.m` to English. No functional changes were made.
+	- Minor README updates: added optional blacklist note in Data Preparation and this changelog.
