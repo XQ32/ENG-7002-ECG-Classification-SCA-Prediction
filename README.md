@@ -2,6 +2,9 @@
 
 This project provides a complete MATLAB pipeline for single-lead ECG processing on SHHS1: preprocessing, Q/R/S/T delineation, beat quality assessment (SQI), feature extraction, beat classification (PVC vs Other), and SCA (sudden cardiac arrest) risk modeling based on post-PVC recovery dynamics. Interactive visualization GUIs are included.
 
+## Internationalization Status
+All source code, comments, and user-facing messages are in English as of 2025-10-08. Earlier mixed-language (Chinese/English) comments were fully translated without altering algorithmic behavior.
+
 ## 1. Repository Structure
 
 ```
@@ -234,6 +237,16 @@ addpath(genpath(pwd));
 savepath; % optional
 ```
 
+### 5.1 Optional External Tooling
+- WFDB command-line tools (only needed if you extend beyond provided MATLAB m-code wrappers).
+- GPU: Not required; all algorithms are CPU-based and fast for single-lead SHHS1 scale.
+- Parallel Computing Toolbox: Optional for future acceleration (current scripts run single-threaded except for MATLAB's internal multithreading in vector ops).
+
+### 5.2 Reproducibility Tips
+- Fix random seed (already set in scripts: e.g., `randomSeed=42`).
+- Avoid modifying generated `*_info.mat` files manually; regenerate instead.
+- Maintain consistent MATLAB version across collaborators for identical floating behavior.
+
 ## 6. Data Preparation
 
 Place the following structure under the repository root (datasets are not included in the repo):
@@ -257,11 +270,22 @@ Note: SHHS1 data are typically already 60 Hz notched. Filtering defaults to `pow
 Optional files:
 - A blacklist CSV (e.g., `badsignallist.csv`) to exclude known low-quality or problematic records. If you use one, set its path at the top of the relevant script(s).
 
-## 7. How to Run
+## 7. Generated Artifacts Overview
+| Stage | Script | Key Outputs (directory) |
+|-------|--------|-------------------------|
+| Beat feature extraction + classifier training | `generate_beats_classifier.m` | `results/trainedClassifier_latest.mat`, `trainingFeatureTable.mat`, `testingFeatureTable.mat` |
+| Batch beat prediction | `predict_shhs1_all.m` | `{record}_info.mat` (EDF folder) |
+| SCA v3 feature aggregation | `generate_sca_classifier_v3.m` | `results/post_ectopic_features_v3.mat` |
+| SCA model training | `generate_sca_classifier_v3.m` | `results/sca_classifier_v3.mat`, `SCA_trainingFeatureTable_v3.mat`, `SCA_testingFeatureTable_v3.mat` |
+| Evaluation plots & tables | `generate_sca_classifier_v3.m` | `results/roc/*.png`, `results/pr/*.png`, calibration / decision curve PNGs, permutation & ablation CSVs |
+
+Keep the `results/` directory under version control ignore (e.g., `.gitignore`) if storing large model artifacts externally.
+
+## 8. How to Run
 
 Run these in MATLAB (ideally step by step):
 
-### 7.1 Train the Beat Classifier (PVC vs Other)
+### 8.1 Train the Beat Classifier (PVC vs Other)
 
 ```matlab
 % Adjust test split, random seed, grid search switches at the top of the script
@@ -272,7 +296,7 @@ Outputs under `results/`:
 - `trainingFeatureTable.mat` / `testingFeatureTable.mat`
 - `trainedClassifier_latest.mat` (and timestamped backups)
 
-### 7.2 Batch Prediction (Generate *_info.mat)
+### 8.2 Batch Prediction (Generate *_info.mat)
 
 ```matlab
 predict_shhs1_all
@@ -281,7 +305,7 @@ predict_shhs1_all
 For each EDF, writes `{record}_info.mat` (in the same folder), containing at least:
 `predPVCIndices, patientVital, fs, recordNumSamples, rGlobalAll, isPVCBeat, qrs_dur_vec, r_amp_vec, sqi_vec, t_amp_vec, tGlobalIndices`.
 
-### 7.3 Train the SCA Risk Model (v3, *_info.mat only)
+### 8.3 Train the SCA Risk Model (v3, *_info.mat only)
 
 ```matlab
 generate_sca_classifier_v3
@@ -292,14 +316,14 @@ Outputs under `results/`:
 - `SCA_trainingFeatureTable_v3.mat` / `SCA_testingFeatureTable_v3.mat`
 - `sca_classifier_v3.mat`
 
-### 7.4 Visualization (QC/Exploration)
+### 8.4 Visualization (QC/Exploration)
 
 ```matlab
 view_shhs_ecg_v2    % dual plots: detection markers + raw/annotations
 view_shhs_ecg_v3    % integrated viewing/classification/navigation + quick SCA risk
 ```
 
-## 8. Frequently Tuned Parameters (Examples)
+## 9. Frequently Tuned Parameters (Examples)
 
 - `ecgFilter.m`:
   - `method_index`: 1=FIR, 2=Butterworth, 3=enhanced pipeline (with QRS enhancement)
@@ -316,7 +340,32 @@ view_shhs_ecg_v3    % integrated viewing/classification/navigation + quick SCA r
 - `generate_sca_classifier_v3.m`:
   - Recovery/baseline params, quality gates, feature selection, threshold search, cost matrix, etc.
 
-## 9. Troubleshooting (FAQ)
+## 10. Model Options Summary (SCA v3)
+Default `modelOptions` in `generate_sca_classifier_v3.m`:
+
+| Field | Default | Notes |
+|-------|---------|-------|
+| Method | AdaBoostM1 | Candidate set: LogitBoost, GentleBoost, AdaBoostM1, RUSBoost, or 'auto' |
+| NumLearningCycles | 200 | Grid may extend to 300 |
+| LearnRate | 0.02 | Tuned by grid if auto selection enabled |
+| MaxNumSplits | 20 | Tree depth control (affects variance) |
+| MinLeafSize | 32 | Regularization (smaller = more variance) |
+| NumVariablesToSample | 'sqrt' | Typical for ensemble diversity |
+| enableCostMatrix | true | Class imbalance weighting (FN cost > FP) |
+| costFP / costFN | 2 / 6 | Adjust to shift precision/recall trade-off |
+| enableThresholdMoving | true | Post-hoc threshold search over `thrCandidates` |
+| pvcThreshold | 0.21 | Updated after CV if threshold moving enabled |
+| cvKFold | 10 | Stratified cross-validation folds |
+| thrCandidates | 0.02:0.01:0.98 | Dense search grid for F1/Recall optimization |
+| calibrationMethod | 'auto' | Chooses Platt vs isotonic based on data size |
+
+Practical guidance:
+- Increase `NumLearningCycles` + modest `LearnRate` if underfitting (flat ROC).
+- Reduce `MinLeafSize` cautiously; inspect permutation importance for overfitting signals.
+- Adjust `costFN` upward if Dead-class recall is clinically prioritized.
+- When switching to RUSBoost, consider disabling cost matrix to avoid double compensating imbalance.
+
+## 11. Troubleshooting (FAQ)
 
 - Missing EDF/annotation directories: create `shhs/...` as in “Data Preparation”; scripts log missing paths.
 - edfread errors or missing ECG channel: ensure the EDF exists and contains variable `ECG` (or something including `ecg/ekg`).
@@ -325,12 +374,12 @@ view_shhs_ecg_v3    % integrated viewing/classification/navigation + quick SCA r
 - No beats after SQI: relax correlation thresholds or `minBeatsForTemplate` in `assessBeatsQuality`.
 - v3 training skips records: records must pass min PVC count and non-PVC SQI ratio gates (tune at the top of the script).
 
-## 10. License & Acknowledgments
+## 12. License & Acknowledgments
 
 - `mcode/` originates from PhysioNet WFDB MATLAB tools (see their `LICENSE.txt` and `README.txt`).
 - SHHS data belong to the original data provider; follow the appropriate data use agreements.
 
-## 11. Citations (if applicable)
+## 13. Citations (if applicable)
 
 - SHHS (Sleep Heart Health Study) datasets and related publications.
 - WFDB tools and PhysioNet resources.
@@ -338,8 +387,14 @@ view_shhs_ecg_v3    % integrated viewing/classification/navigation + quick SCA r
 —
 Questions or contributions are welcome. Feel free to add environment/path/parameter notes to the README and open an issue.
 
-## 12. Changelog
+## 14. Changelog
 
+- 2025-10-08
+	- Added Internationalization Status section and Model Options summary.
+	- Added Generated Artifacts table and reproducibility tips.
+	- Clarified dependency/tooling recommendations.
+	- Ensured section renumbering consistency.
+	- No code changes, documentation only.
 - 2025-09-10
 	- Translated all comments and user-facing output strings in `generate_sca_classifier_v3.m` to English. No functional changes were made.
 	- Minor README updates: added optional blacklist note in Data Preparation and this changelog.
