@@ -1,400 +1,267 @@
-# ENG 7002 | ECG Beat Classification & SCA Risk Prediction (SHHS1)
+## Project Overview
 
-This project provides a complete MATLAB pipeline for single-lead ECG processing on SHHS1: preprocessing, Q/R/S/T delineation, beat quality assessment (SQI), feature extraction, beat classification (PVC vs Other), and SCA (sudden cardiac arrest) risk modeling based on post-PVC recovery dynamics. Interactive visualization GUIs are included.
+This repository implements a complete single-lead ECG pipeline on SHHS1:
 
-## Internationalization Status
-All source code, comments, and user-facing messages are in English as of 2025-10-08. Earlier mixed-language (Chinese/English) comments were fully translated without altering algorithmic behavior.
+- Heartbeat detection and beat-type recognition (PVC vs Other)
+- Record-wise generation of PVC predictions and derived info (`*_info.mat`) without human labels
+- A variable-window feature system of “PVC → sinus recovery dynamics” to build an SCA risk model (binary: Alive=1 / Dead=0)
 
-## 1. Repository Structure
+Key scripts:
 
-```
-ENG-7002-ECG-Classification-SCA-Prediction/
-├─ README.md                        ← Project documentation (this file)
-├─ ecgFilter.m                      ← ECG preprocessing (notch/baseline/low-pass/smoothing/QRS enhancement)
-├─ detectAndClassifyHeartbeats.m    ← R/Q/S/T detection and beat info assembly (with optional SQI)
-├─ assessBeatsQuality.m             ← Template-based SQI (correlation + micro shift alignment)
-├─ extractHeartbeatFeatures.m       ← Extract RR/amplitude/duration/area features from beatInfo
-├─ trainBeatsClassifier.m           ← Train PVC vs Other classifier (AdaBoost)
-├─ generate_beats_classifier.m      ← Batch feature extraction + train/evaluate/save the beat classifier
-├─ predict_shhs1_all.m              ← Predict PVC on all EDFs and write *_info.mat
-├─ generate_sca_classifier_v3.m     ← v3 SCA risk modeling using only *_info.mat (recovery dynamics features)
-├─ view_shhs_ecg_v2.m               ← Visualization: filtered waveform + Q/R/S/T (top), raw + annotations (bottom)
-├─ view_shhs_ecg_v3.m               ← Visualization: integrated view/classify/navigate + quick SCA risk
-├─ mcode/                           ← PhysioNet WFDB MATLAB tools and examples (external toolkit)
-└─ results/                         ← Runtime outputs (models, feature tables; created on first run)
-```
+- `generate_beats_classifier.m`: extract per-beat features from rpoints-annotated records and train the beat-type (PVC/Other) classifier
+- `predict_shhs1_all.m`: iterate over all EDFs and produce `*_info.mat` for each record using the trained beat-type model
+- `generate_sca_classifier_v3.m`: read `*_info.mat`, compute record-level features from PVC-triggered recovery, and train/evaluate the SCA model (v3)
 
-## 2. Core Data Flow and Call Relationships
+Support layers:
 
-### 2.1 Signal Preprocessing and Beat Detection
-```
-ecgFilter
-	├─ Internals: FIR high-pass / IIR high-pass / enhanced pipeline (dual median + high-pass)
-	└─ Output: filtered ECG (method=3 also exports a QRS-enhanced signal)
+- Preprocessing: `ecgFilter.m`
+- Beat detection/labeling: `detectAndClassifyHeartbeats.m` (includes QRS helpers, T-wave seeds, and SQI gating via `assessBeatsQuality.m`)
+- Per-beat features: `extractHeartbeatFeatures.m`
+- `mcode/`: WFDB toolbox (PhysioNet) for MATLAB and examples
 
-detectAndClassifyHeartbeats (core detection + structured beatInfo)
-	├─ local_detect_r_hybrid_fast (R candidates fusion)
-	├─ local_remove_t_as_r (suppress T-as-R)
-	├─ local_detect_qs (Q/S + QRS onset/offset)
-	├─ local_detect_twave (T tagging)
-	├─ assessBeatsQuality (optional SQI gate)
-	└─ Output: heartbeatSegments, beatInfo (with indices and boundaries)
+Outputs (v3):
 
-assessBeatsQuality (template-based quality scoring)
-	├─ Build templates: Other / PVC / Global (fallback when insufficient)
-	├─ Max correlation with ±maxShift tolerance
-	└─ Output: isGood mask / correlation values / template class used
+- `results/post_ectopic_features_v3.mat`: original record-level feature table (with NaN)
+- `results/SCA_trainingFeatureTable_v3.mat`, `results/SCA_testingFeatureTable_v3.mat`
+- `results/sca_classifier_v3.mat`: model package (with importances and univariate effectiveness)
+- `results/*.png`: ROC/PR/calibration/decision curves, etc.
+- `results/*_v3.csv`: univariate effectiveness, ablation, SHAP importance
 
-extractHeartbeatFeatures
-	├─ Input: beatInfo + fs
-	├─ Compute: RR_prev/next, Q/R/S amplitudes, QRS duration, QRS area (prefer qrsOn/Off)
-	└─ Output: featureTable (includes BeatType label)
-```
+Recommended MATLAB version: R2021a+ (to support the SHAP computation path). Toolboxes required: Statistics and Machine Learning, Signal Processing.
 
-### 2.2 Beat Classification (PVC vs Other)
-```
-generate_beats_classifier (script)
-	├─ Enumerate EDF + rpoints annotations
-	├─ ecgFilter → detectAndClassifyHeartbeats → extractHeartbeatFeatures
-	├─ Merge features → stratified train/test split
-	├─ trainBeatsClassifier (AdaBoost; optional cost matrix and threshold moving)
-	├─ Evaluate: confusion matrix / metrics
-	└─ Save: trainingFeatureTable.mat / testingFeatureTable.mat / trainedClassifier_latest.mat
+Data layout requirement (relative to project root):
 
-trainBeatsClassifier
-	├─ Class-frequency weighting + optional cost matrix
-	├─ fitcensemble (AdaBoostM1 + decision trees)
-	├─ Optional threshold-moving predictFcn wrapper
-	└─ Output: trainedClassifier struct + 10-fold CV accuracy
-```
+- `shhs/polysomnography/edfs/shhs1/*.edf`
+- `shhs/polysomnography/annotations-rpoints/shhs1/*-rpoint.csv` (only when training the beat-type model)
+- `shhs/datasets/shhs-cvd-summary-dataset-0.21.0.csv` (mapping `nsrrid → vital`)
 
-### 2.3 Batch Prediction and Persistence
-```
-predict_shhs1_all (script)
-	├─ Load the trained beat classifier
-	├─ For each EDF: ecgFilter → detectAndClassifyHeartbeats (no external labels) → extractHeartbeatFeatures
-	├─ Median-impute missing numeric features → model prediction (optional PVC probability threshold override)
-	└─ Save {record}_info.mat (predPVCIndices, patientVital, and required vectors)
-```
+---
 
-### 2.4 SCA Risk Feature Aggregation and Modeling (v3)
-```
-generate_sca_classifier_v3 (script)
-	├─ Uses only *_info.mat generated by predict_shhs1_all (no EDF reading)
-	├─ Build per-PVC variable-length recovery dynamics features (RR/T/QTc half-life, time constant, overshoot, oscillation, stalls, HR acceleration, etc.)
-	├─ Quality gates (min PVC count, non-PVC SQI ratio)
-	├─ Stratified split + imbalance-friendly models (Logit/Gentle/AdaBoost/Bag; default LogitBoost)
-	├─ Cost matrix and threshold search (optimize recall/F1 of Dead-class)
-	└─ Artifacts: post_ectopic_features_v3.mat / SCA_trainingFeatureTable_v3.mat / sca_classifier_v3.mat
-```
+## Quick Start
 
-### 2.5 Visualization Tools (GUI)
-```
-view_shhs_ecg_v2
-	├─ Load EDF → ecgFilter → detectAndClassifyHeartbeats (no annotations)
-	├─ Top: detection signal with Q/R/S/T; bottom: raw ECG + CSV annotations (if available)
+1) Train (or prepare) the beat-type (PVC/Other) model (optional)
 
-view_shhs_ecg_v3
-	├─ Window browsing, jump, filtering (PVC/Other/All), prev/next navigation, selection highlight
-	├─ One-click detect + features + load beat classifier for online PVC inference
-	└─ Quick SCA risk (load trained v3 model)
-```
+- If `results/trainedClassifier_latest.mat` already exists, skip.
+- Otherwise run: `generate_beats_classifier.m`
+	- It will read rpoints-annotated records → filter → per-beat features → stratified split → train AdaBoost/tree ensembles → save `results/trainedClassifier_latest.mat`.
 
-## 3. Quick Start (End-to-End)
-```
-1) Prepare data directories (see “Data Preparation”).
-2) Train beat classifier: run `generate_beats_classifier.m` (or reuse `results/trainedClassifier_latest.mat`).
-3) Batch prediction: run `predict_shhs1_all.m` to write `{record}_info.mat` for each EDF.
-4) Train SCA risk model: run `generate_sca_classifier_v3.m` (consumes only *_info.mat).
-5) Daily QC/inspection: run `view_shhs_ecg_v2.m` or `view_shhs_ecg_v3.m`.
-```
+2) Generate `*_info.mat`
 
-## 4. Key Data Structures
-```
-beatInfo(i):
-	.beatType          Beat label (PVC/Other; defaults to Other if no external labels)
-	.segment           Beat segment waveform
-	.segmentStartIndex Segment start (global sample index)
-	.rIndex/qIndex/sIndex/tIndex  Indices within the segment
-	.qrsOnIndex/.qrsOffIndex      QRS onset/offset (within the segment)
-	.sqiIsGood/.sqiCorr/.sqiTemplateClass  SQI quality info
+- Run: `predict_shhs1_all.m`
+	- For each EDF: filtering → beat detection and features → use the model from step 1 to classify PVC → write required fields into `{record}_info.mat` in the same folder (see “latestRequiredFields” in the script).
 
-featureTable row:
-	RR_Prev / RR_Post / R_Amplitude / Q_Amplitude / S_Amplitude / QRS_Duration / QRS_Area / BeatType
-```
+3) Train the SCA model (v3)
 
-### 4.1 Beat-Level Features (for `generate_beats_classifier.m`)
-From `extractHeartbeatFeatures` + BeatType; `trainBeatsClassifier` expects the following `RequiredVariables`.
-```
-Predictors (numeric):
-	RR_Prev, RR_Post, R_Amplitude, Q_Amplitude, S_Amplitude, QRS_Duration, QRS_Area
-Label:
-	BeatType (PVC/Other)
-```
+- Run: `generate_sca_classifier_v3.m`
+	- Iterate over `*_info.mat` → compute recovery-dynamics features for each PVC → aggregate to record level → (impute missing + MinMax normalization) → group-wise stratified split (by patient) → univariate evaluation → model training (AdaBoostM1 with threshold moving / Platt calibration) → evaluation and plots → save the model package.
 
-### 4.2 Record-Level (Post-PVC Recovery) Features (`generate_sca_classifier_v3.m`)
+Note: by default, Alive=1 / Dead=0 (`patientVital` is the response).
 
-This v3 script consumes only `{record}_info.mat` files and constructs post-PVC recovery dynamics features without accessing raw ECG. It operates per record as follows:
+---
 
-1) For each predicted PVC, build post-PVC series for RR, T-amplitude, and approximate QTc under quality gates.
-2) Compute per-PVC recovery primitives (half-life, time constant, oscillation, etc.).
-3) Aggregate per-PVC metrics to record-level features and add demographics if present.
-4) Train an imbalance-aware binary classifier (Alive=1 / Dead=0).
+## Signal Processing and Detection (Brief)
 
-Below is the complete list of record-level features exported to `results/post_ectopic_features_v3.mat` and used downstream. Names match the MATLAB struct/table fields.
+- Preprocessing (`ecgFilter.m`):
+	- Power-line notch (optional 50/60 Hz and 2nd/3rd harmonics); three baseline removal strategies (FIR / IIR / enhanced pipeline); low-pass; method 3 adds SG smoothing and Pan–Tompkins-style QRS enhancement.
+- Beat detection (`detectAndClassifyHeartbeats.m`):
+	- Absolute-amplitude + derivative-energy candidates → map back to |x| peaks; remove T-as-R errors; Q/S localization (energy-gated, polarity-adaptive, PVC-wide windows); QRS onset/offset (derivative-threshold tracking); optional template-correlation SQI gating (`assessBeatsQuality.m`).
+- Per-beat features (`extractHeartbeatFeatures.m`):
+	- RR before/after, R/Q/S amplitudes, QRS duration/area, with fallbacks and normalization.
 
-#### 4.2.1 Baseline and Series Definitions
+These steps are orchestrated in `predict_shhs1_all.m` to produce the compact fields required by the v3 generator in `*_info.mat`.
 
-- Baseline window: `[pvcSample - baselineSec, pvcSample)` in seconds; default `baselineSec=50` s.
-- Baseline RR set `baseRR_vec`: non-PVC beats with good SQI on both ends, valid RR range `[minRR, maxRR]` (default `[0.30, 2.50]` s). `muRR = mean(baseRR_vec)`, `sigRR = std(baseRR_vec)`; fallback to robust stats if too few beats (`baselineMinBeats=10`).
-- Post-PVC RR series: indices after the PVC with conditions: non-PVC, good SQI on both ends, valid RR range, and within observation window up to `maxObsSec=50` s (or earlier next PVC).
-- Deviation for RR: `dev_rr(t) = |RR(t) - muRR| / muRR`.
-- T-amplitude baseline `muTamp`: mean absolute T amplitude within baseline if available.
-- T deviation: `dev_tamp(t) = |Tamp(t) - muTamp| / muTamp` (when `muTamp > 0`).
-- Approximate QTc per beat: with T-peak index `tGlobalIdx(j) > rGlobalAll(j)` and `RR(j) > 0`, approximate `QT ≈ (tGlobalIdx - rIndex)/fs + 0.5*QRS_dur(j)` and `QTc = QT / RR^(1/3)`; valid QT ∈ [0.20, 0.60] s and QTc ∈ [0.30, 0.70] s. Deviation `dev_qtc(t) = |QTc(t) - muQTc| / muQTc`, where `muQTc` is the baseline mean of valid QTc.
-- HRT metrics:
-	- `HRT_TO = (RR_Post1 - RR_Pre) / RR_Pre`.
-	- `HRT_TS` (approximate): among the 5–15th post-PVC eligible RR intervals, take the maximum slope over any 5-consecutive RR window, i.e., `max{ (RR(i+4) - RR(i))/4 }`.
+---
 
-Key parameters (defaults in `generate_sca_classifier_v3.m`):
-- `consecStableBeats=10` (required consecutive beats to declare stability).
-- `hrt_ts_low_thr=0.0` (threshold to flag abnormally low TS).
+## v3 Core: Full List and Explanation of “Features Used for Training”
 
-#### 4.2.2 Per-PVC Recovery Primitives
+`generate_sca_classifier_v3.m` computes many PVC-level recovery metrics and aggregates them to record-level features, then selects 15 core features based on experience and SHAP/univariate/AUC criteria. Below are the 15 features actually used for training (original name → renamed) and their meaning. We use dev to denote relative deviation: $\text{dev}_{RR}=|RR-\mu_{RR}|/\mu_{RR}$.
 
-- Half-life of RR deviation, 50%/30%/10%: first time `t` where `dev_rr ≤ {0.50, 0.30, 0.10}` holds for `consecStableBeats` consecutive points.
-- Time constant of RR deviation `tau_rr`: fit `y = log(max(dev_rr, eps))` vs `t` over the first K points (K=8) by linear regression; if slope `a < 0`, `tau = -1/a`, else `NaN`.
-- AUC of RR deviation `auc_rr`: trapezoidal ∫ dev_rr dt, with time normalized by `baselineSec` to reduce long-record bias (not included in final record features).
-- Oscillation index `oscill_rr`: fraction of sign changes in the first difference of `dev_rr` (number of sign flips divided by number of difference steps).
-- Recovery stalls `stalls_rr`: number of qualifying under-threshold segments (threshold 0.20 with length ≥ `consecStableBeats`) minus one; indicates re-instability after initial convergence (not aggregated in final features).
-- Late instability variance `late_var_rr`: variance of `dev_rr` for `t ≥ 5 s` (not aggregated in final features).
-- T-amplitude half-life and AUC analogous to RR (AUC not kept in final features).
-- QTc half-life and AUC of `dev_qtc` (AUC kept as mean at record-level; see below).
-- Coupling ratio `coupling_ratio = RR_Pre / muRR`.
-- Peak HR acceleration `hr_peak_accel_bpm = max( 60/RR_Post1 - 60/muRR, 60/RR_Post2 - 60/muRR )`.
-- Early/Late mean deviation of RR: early window `[0,5]` s, late window `(5,15]` s.
-- Piecewise linear slopes of RR deviation: slope over `[0,5]` s and `(5,15]` s via linear fit.
-- Sample entropy (RR deviation): `SampEn(m=2, r=0.2*std)` (not aggregated in final features).
-- LZ complexity (RR deviation sign of first difference) (not aggregated in final features).
-- Poincaré SD1/SD2 ratio: Post (≤10 s) vs Pre baseline ratio (not aggregated in final features).
-- 95th percentile of RR deviation (not aggregated in final features).
-- Spearman correlation between `dev_rr` and `dev_tamp` (kept as median at record-level).
-- QTc overshoot fraction and magnitude: fraction where `dev_qtc > 0.10` and magnitude above 0.10 (only fraction is kept at record-level).
+1) PVC_FreqPerHour (orig: PVCs_per_hour → new: PVC_FreqPerHour)
+- Definition: PVC count per hour (normalized by total record duration).
+- Meaning: PVC burden/frequency.
 
-#### 4.2.3 Record-Level Feature Dictionary (exported columns)
+2) RRI_Recovery_TimeConst_Median (orig: tau_rr_median → new: RRI_Recovery_TimeConst_Median)
+- Definition: the time constant $\tau$ from a log-linear fit on the first K points (K=8 by default) of dev_RR; aggregated by median over PVCs.
+- Meaning: scale of exponential recovery speed; larger means slower recovery.
 
-Below are the exact table columns with units and formulas/aggregation:
+3) RRI_PostPVC_OscillAmp_Median (orig: oscill_rr_median → new: RRI_PostPVC_OscillAmp_Median)
+- Definition: normalized oscillation index from sign flips of the first difference of dev_RR (`local_oscillation_index`); aggregated by median.
+- Meaning: oscillation/underdamped behavior during recovery.
 
-- `record` (string): record base name, e.g., `shhs1-XXXXXX`.
-- `patientVital` (numeric): 1=Alive, 0=Dead (response variable).
-- `PVCs_per_hour` (1/hour): number of PVCs divided by record duration (hours).
-- `PVC_count` (count): total number of PVCs in the record.
-- `recovery_failure_ratio` (0–1): fraction of PVCs where recovery metrics could not be determined within the observation window (e.g., insufficient valid points or censored before reaching stability).
-- `halflife_rr_median` (s): median of 50% half-life of `dev_rr` across PVCs.
-- `halflife_rr30_median` (s): median of 30% half-life of `dev_rr` across PVCs.
-- `halflife_rr10_median` (s): median of 10% half-life of `dev_rr` across PVCs.
-- `tau_rr_median` (s): median time constant from the log-linear fit on the first K points (K=8) per PVC.
-- `oscill_rr_median` (0–1): median oscillation index of `dev_rr` across PVCs (sign-change rate of first differences).
-- `HRT_TO_abnormal_frac` (0–1): fraction of PVCs with `HRT_TO ≥ 0` (treated as abnormal in this pipeline).
-- `HRT_TS_low_frac` (0–1): fraction of PVCs with `HRT_TS ≤ hrt_ts_low_thr` (default threshold 0.0).
-- `halflife_tamp_median` (s): median 50% half-life of T-amplitude deviation `dev_tamp` across PVCs.
-- `halflife_qtc_median` (s): median 50% half-life of QTc deviation `dev_qtc` across PVCs.
-- `auc_qtc_mean` (unitless): mean AUC of `dev_qtc` (time normalized by `baselineSec`).
-- `RR_Pre_RMSSD_mean` (s): mean RMSSD computed from baseline RR per PVC; for each PVC baseline RR sequence, `RMSSD = sqrt(mean(diff(RR)^2))`, then averaged.
-- `coupling_ratio_mean` (unitless): mean `RR_Pre / muRR` across PVCs.
-- `hr_peak_accel_bpm_mean` (bpm): mean of peak HR acceleration (see definition above) across PVCs.
-- `rr_dev_late_minus_early` (unitless): median(late mean deviation) − median(early mean deviation) across PVCs.
-- `rr_dev_slope_0_5s_med` (unitless/s): median slope of `dev_rr` over `[0,5]` s across PVCs (linear fit).
-- `tamp_rr_corr_med` (−1..1): median Spearman correlation between `dev_rr` and `dev_tamp` (matched time points) across PVCs.
-- `qtc_overshoot_frac_mean` (0–1): mean fraction of time points where `dev_qtc > 0.10` across PVCs.
-- `recovery_rate_hmean` (1/s): mean of `1 / halflife_rr` across PVCs with finite positive half-life (harmonic-mean-like recovery rate).
-- `PVC_to_next_nonPVC_sec_mean` (s): mean time from PVC occurrence to the next non-PVC beat.
-- `PVC_to_next_nonPVC_sec_max` (s): max time from PVC to the next non-PVC beat.
-- `PVC_to_next_nonPVC_sec_min` (s): min time from PVC to the next non-PVC beat.
-- `nsrrid` (string): subject ID derived from record name (e.g., `shhs1-200002` → `200002`).
-- `censdate` (numeric): follow-up censor date (if available in covariate CSV; used for analysis, not as a predictor).
-- `age_s1` (years): age at visit S1, truncated at 90 in the source dataset (if present in covariate CSV).
+4) HRT_TurbOnset_AbnormalFrac (orig: HRT_TO_abnormal_frac → new: HRT_TurbOnset_AbnormalFrac)
+- Definition: fraction of abnormal heart rate turbulence TO (threshold TO≥0 in the script).
+- Meaning: abnormal vagal/sympathetic response to PVC (first post-PVC RR change).
+
+5) RRI_PostPVC_OscillAmp_Log (orig: oscill_log → new: RRI_PostPVC_OscillAmp_Log)
+- Definition: log transform of feature 3, log(max(oscill, eps)).
+- Meaning: compress high oscillation values, reduce long-tail effects.
+
+6) PVC_FreqPerHour_Sqrt (orig: pvc_freq_sqrt → new: PVC_FreqPerHour_Sqrt)
+- Definition: square root transform of PVC frequency.
+- Meaning: mitigate scale effects in very high-frequency records.
+
+7) RRI_Oscill_x_PVC_Freq (orig: oscill_x_pvc_freq → new: RRI_Oscill_x_PVC_Freq)
+- Definition: oscillation index × PVC frequency.
+- Meaning: combined burden for high PVC frequency and strong oscillation.
+
+8) RRI_Recovery_EarlyLate_Ratio (orig: early_late_ratio → new: RRI_Recovery_EarlyLate_Ratio)
+- Definition: ratio of early to mid-term recovery half-life: `halflife_rr10_median / halflife_rr30_median`.
+- Meaning: relational speed between early and mid recovery (>1 often indicates “fast early, slower mid”).
+
+9) RRI_Recovery_TimeVariability_CV (orig: halflife_cv → new: RRI_Recovery_TimeVariability_CV)
+- Definition: coefficient of variation (CV) of (50%) recovery half-life across PVCs.
+- Meaning: instability/inconsistency of recovery times across PVCs.
+
+10) Clinical_CompositeRisk_Score (orig: composite_risk_score → new: Clinical_CompositeRisk_Score)
+- Definition: experience-weighted composite: oscill_norm(0.40) + pvc_norm(0.30) + hl10_norm(0.30), where each is normalized to [0,1] by common thresholds.
+- Meaning: clinically interpretable combined risk indicator.
+
+11) RRI_OscillLog_x_PVC_Freq (orig: oscill_log_x_pvc → new: RRI_OscillLog_x_PVC_Freq)
+- Definition: log-oscillation × PVC frequency.
+- Meaning: interaction of two strong single features.
+
+12) RRI_Oscill_x_RecoveryCV (orig: oscill_x_cv → new: RRI_Oscill_x_RecoveryCV)
+- Definition: oscillation index × CV of recovery half-life (feature 9).
+- Meaning: synergy between oscillation and recovery instability.
+
+13) PVC_Burden_NormIndex (orig: pvc_burden_index → new: PVC_Burden_NormIndex)
+- Definition: normalized PVC burden: `(PVCs_per_hour/50) * (oscill_rr_median/0.5)` with cap at 2.0.
+- Meaning: interpretable composite of frequency × oscillation.
+
+14) RRI_Recovery_CapacityIndex (orig: recovery_capacity → new: RRI_Recovery_CapacityIndex)
+- Definition: recovery capacity index: `fast_recovery_ratio / early_late_ratio`, where `fast_recovery_ratio = proportion(halflife≤10s)`.
+- Meaning: larger means “more PVCs recover quickly + more balanced early/mid speeds”.
+
+15) RRI_Oscill_Freq_LogRatio (orig: oscill_pvc_log_ratio → new: RRI_Oscill_Freq_LogRatio)
+- Definition: log-oscillation / log PVC frequency: `oscill_log / log(max(PVCs_per_hour,1))`.
+- Meaning: relative strength of oscillation vs frequency on the log scale.
 
 Notes:
-- Some per-PVC primitives are computed but not retained at record level (e.g., `auc_rr`, `stalls_rr`, `late_var_rr`, sample entropy, LZ complexity, Poincaré ratio). They were explored and may be re-enabled for ablation/experiments.
-- Default quality gates: `minPVCPerRecord=10`, `minSQIRatio=0.60` (ratio of usable non-PVC beats with good SQI); records failing gates are skipped.
-- Observation window ends at the earlier of: `pvcSample + maxObsSec*fs`, next PVC sample − 1, or end of record.
 
-Response variable: `patientVital` (1=Alive, 0=Dead).
+- All features are record-level aggregates; PVC-level metrics (half-life, oscillation, etc.) are computed per PVC, then aggregated by median/mean/ratios/interactions.
+- Other computed but excluded “low-value features” (e.g., `halflife_rr_median`, `HRT_TS_low_frac`, `halflife_qtc_median`, `PVC_to_next_nonPVC_sec_*`) are fully listed in the script’s `lowValueFeatures`. The generator ultimately keeps only the 15 features above for training.
+- Before training: group-wise stratified split by patient, missing imputation with training-set medians, MinMax normalization (fit on training), and optional demographics (disabled by default).
 
-## 5. Environment & Dependencies
+---
 
-- MATLAB R2021b or later recommended (uses edfread, filtfilt, movmedian, medfilt1, etc.)
-- Toolboxes (recommended):
-  - Signal Processing Toolbox (filters/median/SG filter)
-  - Statistics and Machine Learning Toolbox (fitcensemble, etc.)
-- Windows/macOS/Linux supported. This repo ships `mcode/` (PhysioNet WFDB MATLAB tools). The main pipeline does not strictly depend on WFDB binaries but they’re useful for extensions.
+### Full Candidate Set and Exclusions (Transparency)
 
-On first run, consider:
+Before selecting the 15 core features, v3 constructs a comprehensive record-level candidate set from PVC recovery, HRT, QTc/T recovery, and complexity metrics, then applies transformations/ratios/interactions/CVs/threshold flags. Below are the main categories/examples and the explicit low-value exclusion list.
 
-```matlab
-addpath(genpath(pwd));
-savepath; % optional
-```
+- Basic burden/quality:
+	- PVCs_per_hour (per-hour PVC), PVC_count (total), recovery_failure_ratio (fraction not recovered within the max observation window), RR_Pre_RMSSD_mean (baseline RR RMSSD before PVC)
+- Recovery time/rate:
+	- halflife_rr_median / halflife_rr30_median / halflife_rr10_median (50%/30%/10% half-life medians)
+	- tau_rr_median (time constant median), recovery_rate_hmean (harmonic mean of half-life as “speed”)
+- Recovery shape/oscillation/stability:
+	- oscill_rr_median (oscillation index median), late_var_rr (late variance)
+	- PVC_to_next_nonPVC_sec_mean/max/min (time from PVC to the next non-PVC beat)
+- HRT (heart rate turbulence):
+	- HRT_TO_abnormal_frac (abnormal TO fraction), HRT_TS_low_frac (low TS fraction)
+- T/QTc recovery:
+	- halflife_tamp_median, halflife_qtc_median, auc_qtc_mean, qtc_overshoot_frac_mean, qtc_over_mag
+- Complexity/nonlinearity/correlation:
+	- sampen_rr (sample entropy), lzc_rr (Lempel-Ziv on binary first-difference signs), poincare_ratio_pp (SD1/SD2 ratio pre-post)
+	- tamp_rr_corr_med (correlation between T amplitude and RR deviation)
+- Slopes/segments:
+	- rr_dev_slope_0_5s_med (0–5 s slope median), slope_rr_dev_5_15s (5–15 s slope)
+- PVC coupling/HR dynamics:
+	- coupling_ratio_mean (RR_pre / baseline RR), hr_peak_accel_bpm_mean (peak HR acceleration after PVC)
+- Derived/interaction/transforms:
+	- log/sqrt: oscill_log, pvc_freq_log, pvc_freq_sqrt, halflife30_log, halflife10_sqrt
+	- interactions: oscill_x_pvc_freq, oscill_x_recovery, pvc_x_variability, oscill_log_x_pvc, oscill_x_cv, early_late_x_cv
+	- ratios/normalized: oscill_per_pvc, recovery_efficiency, early_late_ratio, oscill_pvc_log_ratio
+	- variability: oscill_cv, halflife_cv, combined_cv, recovery_oscill_cv_ratio, tau_x_cv
+	- composite/threshold: composite_risk_score, instability_score, pvc_burden_index, recovery_capacity, high_freq_high_oscill, slow_recovery_high_cv, composite_high_risk, HRT_abnormal_combined, HRT_risk_category
 
-### 5.1 Optional External Tooling
-- WFDB command-line tools (only needed if you extend beyond provided MATLAB m-code wrappers).
-- GPU: Not required; all algorithms are CPU-based and fast for single-lead SHHS1 scale.
-- Parallel Computing Toolbox: Optional for future acceleration (current scripts run single-threaded except for MATLAB's internal multithreading in vector ops).
+To improve generalization and stability, the following low-value features are excluded before final training (from `lowValueFeatures` with SHAP/AUC/multivariate checks):
 
-### 5.2 Reproducibility Tips
-- Fix random seed (already set in scripts: e.g., `randomSeed=42`).
-- Avoid modifying generated `*_info.mat` files manually; regenerate instead.
-- Maintain consistent MATLAB version across collaborators for identical floating behavior.
+- Batch 1 (native low-value/redundant):
+	- PVC_count, coupling_ratio_mean, recovery_rate_hmean, halflife_rr_median, PVC_to_next_nonPVC_sec_mean, PVC_to_next_nonPVC_sec_min, HRT_TS_low_frac, auc_qtc_mean, qtc_overshoot_frac_mean, halflife_tamp_median, halflife_qtc_median, rr_dev_late_minus_early
+- Batch 2 (newly introduced but poor, e.g., SHAP<0.015):
+	- halflife_rr10_median, tamp_rr_corr_med, halflife10_sqrt, recovery_efficiency, oscill_per_pvc, recovery_deceleration, HRT_risk_category, pvc_x_variability
+- Batch 3 (not in Top15 or likely overfitting from complex interactions):
+	- oscill_x_recovery, halflife30_log, combined_cv, early_late_x_cv, instability_score, high_freq_high_oscill, slow_recovery_high_cv, composite_high_risk, RR_Pre_RMSSD_mean, recovery_failure_ratio, halflife_rr30_median
+- Batch 4 (final pruning to 15):
+	- tau_x_cv, HRT_abnormal_combined, pvc_freq_log, rr_dev_slope_0_5s_med, oscill_cv, hr_peak_accel_bpm_mean, recovery_oscill_cv_ratio, PVC_to_next_nonPVC_sec_max, fast_recovery_ratio
 
-## 6. Data Preparation
+The 15 retained training features are fully explained in the previous section (with renamed names).
 
-Place the following structure under the repository root (datasets are not included in the repo):
+---
 
-```
-shhs/
-  polysomnography/
-    edfs/
-      shhs1/
-        shhs1-XXXXXX.edf            # multiple EDFs
-    annotations-rpoints/
-      shhs1/
-        shhs1-XXXXXX-rpoint.csv     # R-point annotations (Type/seconds/…), for supervised training
-  datasets/
-    shhs-cvd-summary-dataset-0.21.0.csv  # contains nsrrid and vital (0=Dead,1=Alive)
-results/                               # runtime outputs (created if missing)
-```
+## Training and Evaluation Setup (v3)
 
-Note: SHHS1 data are typically already 60 Hz notched. Filtering defaults to `power_line_freq=0` to avoid double-notching.
+- Algorithm: AdaBoostM1 (auto-search indicates best among candidates; also considers `LogitBoost/GentleBoost/RUSBoost`)
+- Typical hyperparameters: NLC=250, LR=0.015, MaxSplits=20, MinLeaf=60, NumVars='sqrt'
+- Class imbalance: cost matrix (FP=2, FN=8) to emphasize recall for the Dead class
+- Threshold moving: optimize F1 (Dead) on cross-validation; probabilities may use Platt calibration
+- Cross-validation: K=10
+- Metrics: AUC/AUPRC/Brier, confusion matrices (Dead as positive), calibration/PR/ROC/decision curves
+- Importance: model gain, SHAP (test subset sampling, MATLAB R2021a+ or local implementation), univariate discriminative power (AUC/MI/Cohen’s d/rank-sum)
 
-Optional files:
-- A blacklist CSV (e.g., `badsignallist.csv`) to exclude known low-quality or problematic records. If you use one, set its path at the top of the relevant script(s).
+Main outputs:
 
-## 7. Generated Artifacts Overview
-| Stage | Script | Key Outputs (directory) |
-|-------|--------|-------------------------|
-| Beat feature extraction + classifier training | `generate_beats_classifier.m` | `results/trainedClassifier_latest.mat`, `trainingFeatureTable.mat`, `testingFeatureTable.mat` |
-| Batch beat prediction | `predict_shhs1_all.m` | `{record}_info.mat` (EDF folder) |
-| SCA v3 feature aggregation | `generate_sca_classifier_v3.m` | `results/post_ectopic_features_v3.mat` |
-| SCA model training | `generate_sca_classifier_v3.m` | `results/sca_classifier_v3.mat`, `SCA_trainingFeatureTable_v3.mat`, `SCA_testingFeatureTable_v3.mat` |
-| Evaluation plots & tables | `generate_sca_classifier_v3.m` | `results/roc/*.png`, `results/pr/*.png`, calibration / decision curve PNGs, permutation & ablation CSVs |
+- `sca_classifier_v3.mat` contains: model, required feature names, key train/test metrics, univariate effectiveness, importances
+- `roc_curve_train_test.png`, `pr_curve_train_test.png`, `calibration_curve_train_test.png`, `decision_curve_test.png`
+- `feature_effectiveness_*.csv`, `shap_importance_v3.csv`, `ablation_demographic_physio_combined_v3.csv`
 
-Keep the `results/` directory under version control ignore (e.g., `.gitignore`) if storing large model artifacts externally.
+---
 
-## 8. How to Run
+## Suggested Repro Steps
 
-Run these in MATLAB (ideally step by step):
+In MATLAB:
 
-### 8.1 Train the Beat Classifier (PVC vs Other)
+1) Ensure data are placed as described under “Data layout requirement”, and set the project root (`pwd`) to this repo root.
+2) Run `generate_beats_classifier.m` (if you need to retrain the beat-type model; requires rpoints).
+3) Run `predict_shhs1_all.m` to produce `*_info.mat` (no rpoints needed).
+4) Run `generate_sca_classifier_v3.m` to produce features, train, and evaluate.
 
-```matlab
-% Adjust test split, random seed, grid search switches at the top of the script
-generate_beats_classifier
-```
+Visualization: `view_shhs_ecg_v2.m` / `view_shhs_ecg_v3.m` help inspect records and debug.
 
-Outputs under `results/`:
-- `trainingFeatureTable.mat` / `testingFeatureTable.mat`
-- `trainedClassifier_latest.mat` (and timestamped backups)
+---
 
-### 8.2 Batch Prediction (Generate *_info.mat)
+## Important Implementation Details and Edge Cases
 
-```matlab
-predict_shhs1_all
-```
+- Baseline/recovery statistics: within `baselineSec=50s`, take non-PVC and good-SQI beats to compute means/SDs for RR/T/QTc; fallback to global stats when insufficient.
+- Recovery determination: dev sequence entering thresholds (e.g., 50%/30%/10%) for `consecStableBeats=10` consecutive beats is considered reaching the corresponding “half-life”.
+- Reasonable RR range: `[0.30, 2.50] s`; PVC quality gating at record level: `minPVCPerRecord=10` and `minSQIRatio=0.60`.
+- QTc approximation: use global T indices and QRS duration to estimate QT; Bazett cube-root correction; range capping; derive deviation and over-threshold fractions.
+- Group-wise stratified split: by patient ID to avoid data leakage across train/test.
 
-For each EDF, writes `{record}_info.mat` (in the same folder), containing at least:
-`predPVCIndices, patientVital, fs, recordNumSamples, rGlobalAll, isPVCBeat, qrs_dur_vec, r_amp_vec, sqi_vec, t_amp_vec, tGlobalIndices`.
+---
 
-### 8.3 Train the SCA Risk Model (v3, *_info.mat only)
+## Dependencies and Environment
 
-```matlab
-generate_sca_classifier_v3
-```
+- MATLAB R2021a+ (recommended)
+- Toolboxes: Statistics and Machine Learning, Signal Processing
+- (Optional) WFDB MATLAB toolbox in `mcode/` (bundled copy; mainly for extension/validation; not a hard dependency for v3)
 
-Outputs under `results/`:
-- `post_ectopic_features_v3.mat`
-- `SCA_trainingFeatureTable_v3.mat` / `SCA_testingFeatureTable_v3.mat`
-- `sca_classifier_v3.mat`
+---
 
-### 8.4 Visualization (QC/Exploration)
+## FAQ
 
-```matlab
-view_shhs_ecg_v2    % dual plots: detection markers + raw/annotations
-view_shhs_ecg_v3    % integrated viewing/classification/navigation + quick SCA risk
-```
+- Q: No rpoints available—can I still run v3?
+	- A: Yes. Use an existing `results/trainedClassifier_latest.mat` (or train your own) and run `predict_shhs1_all.m`, which needs no rpoints and will classify PVC and generate `*_info.mat`. Then run `generate_sca_classifier_v3.m`.
 
-## 9. Frequently Tuned Parameters (Examples)
+- Q: Feature names mismatch?
+	- A: v3 renames the 15 core features before training (for better statistical/physiological semantics). The script contains the original→new mapping, and the list above shows both.
 
-- `ecgFilter.m`:
-  - `method_index`: 1=FIR, 2=Butterworth, 3=enhanced pipeline (with QRS enhancement)
-  - `power_line_freq`: 0/50/60 (SHHS1 suggests 0)
-- `detectAndClassifyHeartbeats.m`:
-  - Refractory, energy/slope thresholds, PVC wide-QRS adaptive windows (auto-adapts to fs)
-  - Optional `assessBeatsQuality` (enabled by default)
-- `assessBeatsQuality.m`:
-  - `windowSec`, `bandpassHz`, `minBeatsForTemplate`, correlation thresholds, `maxShiftSec`
-- `generate_beats_classifier.m`:
-  - Split, blacklist, hyperparameter search, threshold moving, cost matrix
-- `predict_shhs1_all.m`:
-  - `pvcThresholdOverride` (higher → higher precision, lower recall)
-- `generate_sca_classifier_v3.m`:
-  - Recovery/baseline params, quality gates, feature selection, threshold search, cost matrix, etc.
+- Q: Why were some QTc/T-wave related features removed?
+	- A: Based on SHAP/univariate power and multivariate validation, low-performing or redundant features were removed to keep 15 core features for better generalization.
 
-## 10. Model Options Summary (SCA v3)
-Default `modelOptions` in `generate_sca_classifier_v3.m`:
+---
 
-| Field | Default | Notes |
-|-------|---------|-------|
-| Method | AdaBoostM1 | Candidate set: LogitBoost, GentleBoost, AdaBoostM1, RUSBoost, or 'auto' |
-| NumLearningCycles | 200 | Grid may extend to 300 |
-| LearnRate | 0.02 | Tuned by grid if auto selection enabled |
-| MaxNumSplits | 20 | Tree depth control (affects variance) |
-| MinLeafSize | 32 | Regularization (smaller = more variance) |
-| NumVariablesToSample | 'sqrt' | Typical for ensemble diversity |
-| enableCostMatrix | true | Class imbalance weighting (FN cost > FP) |
-| costFP / costFN | 2 / 6 | Adjust to shift precision/recall trade-off |
-| enableThresholdMoving | true | Post-hoc threshold search over `thrCandidates` |
-| pvcThreshold | 0.21 | Updated after CV if threshold moving enabled |
-| cvKFold | 10 | Stratified cross-validation folds |
-| thrCandidates | 0.02:0.01:0.98 | Dense search grid for F1/Recall optimization |
-| calibrationMethod | 'auto' | Chooses Platt vs isotonic based on data size |
+## Acknowledgments
 
-Practical guidance:
-- Increase `NumLearningCycles` + modest `LearnRate` if underfitting (flat ROC).
-- Reduce `MinLeafSize` cautiously; inspect permutation importance for overfitting signals.
-- Adjust `costFN` upward if Dead-class recall is clinically prioritized.
-- When switching to RUSBoost, consider disabling cost matrix to avoid double compensating imbalance.
+- SHHS data from the National Sleep Research Resource (NSRR)
+- WFDB tools from PhysioNet (see `mcode/` and its LICENSE)
 
-## 11. Troubleshooting (FAQ)
+---
 
-- Missing EDF/annotation directories: create `shhs/...` as in “Data Preparation”; scripts log missing paths.
-- edfread errors or missing ECG channel: ensure the EDF exists and contains variable `ECG` (or something including `ecg/ekg`).
-- Missing class during training: if one class is absent, the script falls back to equal weights; check annotations and feature filtering.
-- Missing features at prediction: the script prints missing variable names; keep feature names consistent with `RequiredVariables`.
-- No beats after SQI: relax correlation thresholds or `minBeatsForTemplate` in `assessBeatsQuality`.
-- v3 training skips records: records must pass min PVC count and non-PVC SQI ratio gates (tune at the top of the script).
+## Changelog (aligned with scripts)
 
-## 12. License & Acknowledgments
+- 2025-09-04: v3 initial
+- 2025-10-08: refactor and comments; centralized config; consistent feature selection and naming
 
-- `mcode/` originates from PhysioNet WFDB MATLAB tools (see their `LICENSE.txt` and `README.txt`).
-- SHHS data belong to the original data provider; follow the appropriate data use agreements.
+For more details or script parameters, please refer to headers and inline comments in the corresponding MATLAB files.
 
-## 13. Citations (if applicable)
-
-- SHHS (Sleep Heart Health Study) datasets and related publications.
-- WFDB tools and PhysioNet resources.
-
-—
-Questions or contributions are welcome. Feel free to add environment/path/parameter notes to the README and open an issue.
-
-## 14. Changelog
-
-- 2025-10-08
-	- Added Internationalization Status section and Model Options summary.
-	- Added Generated Artifacts table and reproducibility tips.
-	- Clarified dependency/tooling recommendations.
-	- Ensured section renumbering consistency.
-	- No code changes, documentation only.
-- 2025-09-10
-	- Translated all comments and user-facing output strings in `generate_sca_classifier_v3.m` to English. No functional changes were made.
-	- Minor README updates: added optional blacklist note in Data Preparation and this changelog.
